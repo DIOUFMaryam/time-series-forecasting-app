@@ -35,6 +35,15 @@ Order selection fix (SARIMA was very slow):
   capped at 1.
 - Typical result: SARIMA(1,1,1)(1,0,1,12) instead of SARIMA(1,1,9)(4,0,1,12),
   which fits in seconds instead of minutes and overfits far less.
+
+Forecast fixes:
+- the test forecast was shifted by one month (each forecast was compared
+  with the previous month's actual value); the training fit in the plot too
+- future forecasts came from the model fitted on the first 80% only, so
+  they ignored the most recent 20% of the data; the model is now refitted
+  on the whole series first (future_forecast)
+- baselines (seasonal_naive_accuracy, persistence_accuracy) to put the
+  accuracy figures in context
 """
 import pandas as pd
 import numpy as np
@@ -256,24 +265,70 @@ def sarima_training(timeseries, p, d, q, P, D, Q):
 
 
 def sarima_forecasting(test, fitted_model):
-    forecast_steps = len(test)+1
-    forecast = fitted_model.get_forecast(steps=forecast_steps)
-    #forecast_ci = forecast.conf_int()
-    return forecast.predicted_mean[1:]
+    # Forecast exactly the test period: step 1 is the first test month.
+    # (It used to forecast len(test)+1 steps and drop the first one, so each
+    # forecast was compared with the previous month's actual value.)
+    forecast = fitted_model.get_forecast(steps=len(test))
+    return pd.Series(np.asarray(forecast.predicted_mean), index=test.index)
+
+
+def next_months(last_date, horizon):
+    # Monthly dates following `last_date`
+    return pd.DatetimeIndex([last_date + pd.DateOffset(months=k) for k in range(1, horizon + 1)])
+
+
+def future_forecast(timeseries, p, d, q, P, D, Q, horizon):
+    """Refit the model on the WHOLE series and forecast the `horizon` months
+    after its last date. The model fitted on the training split only is for
+    testing: forecasting the future with it would ignore the test period
+    (the most recent 20% of the data) and start from the wrong point."""
+    ts = timeseries.dropna()
+    if horizon is None or horizon < 1:
+        return pd.Series(dtype=float)
+    full_model = sarima_training(ts, p, d, q, P, D, Q)
+    values = np.asarray(full_model.forecast(horizon))
+    return pd.Series(values, index=next_months(ts.index[-1], horizon))
 
 
 def sarima_predictions(fitted_model, timeseries, train, forecast, horizon, p, d, q, P, D, Q):
+    timeseries = timeseries.dropna()
     fig = make_subplots()
     fig.add_trace(go.Scatter(x=timeseries.index, y=timeseries, mode='lines', name=f"{timeseries.name}"))
-    train_predictions = fitted_model.predict(start=0, end=len(train)-1)
-    fig.add_trace(go.Scatter(x=train_predictions.index, y=fitted_model.predict(start=1, end=len(train)), mode='lines', name="Train predictions"))
-    test_predictions = fitted_model.predict(start=len(train), end=len(train)+len(forecast)-1)
-    fig.add_trace(go.Scatter(x=test_predictions.index, y=forecast, mode='lines', name="Test predictions"))
-    future_predictions = fitted_model.predict(start=len(train)+len(forecast), end=len(train)+len(forecast)+horizon-1)
-    fig.add_trace(go.Scatter(x=future_predictions.index, y=fitted_model.predict(start=len(train)+len(forecast)+1, end=len(train)+len(forecast)+horizon+1), mode='lines', name="Future predictions"))
+    # One-step-ahead fit on the training months. The first d + 12*D values
+    # are start-up values of the differencing, not real predictions.
+    burn_in = d + 12 * D
+    fitted = pd.Series(np.asarray(fitted_model.fittedvalues), index=train.index)[burn_in:]
+    fig.add_trace(go.Scatter(x=fitted.index, y=fitted.values, mode='lines', name="Train predictions"))
+    fig.add_trace(go.Scatter(x=forecast.index, y=forecast.values, mode='lines', name="Test predictions"))
+    future = future_forecast(timeseries, p, d, q, P, D, Q, horizon)
+    if not future.empty:
+        fig.add_trace(go.Scatter(x=future.index, y=future.values, mode='lines', name="Future predictions"))
     fig.update_layout(yaxis_title=f"{train.name}", xaxis_title="Date", template='plotly_white')
     fig.update_layout(title_text=f"SARIMA (({p}, {d}, {q}),({P}, {D}, {Q})) plot of {train.name}")
     return fig
+
+
+def seasonal_naive_accuracy(timeseries, train_share=0.80, season=SEASON):
+    """Accuracy (100 - MAPE) of the "same month last year" forecast on the
+    same test split as SARIMA: a reference that needs no model at all."""
+    ts = np.asarray(timeseries.dropna(), dtype=float)
+    n = int(len(ts) * train_share)
+    if n < season or n >= len(ts):
+        return np.nan
+    test = ts[n:]
+    naive = np.array([ts[n - season + (i % season)] for i in range(len(test))])
+    return 100 - accuracy_metrics(naive, test)[2]
+
+
+def persistence_accuracy(timeseries, train_share=0.80):
+    """Accuracy of "next month = this month's actual value", one month
+    ahead over the test split: the reference for a one-step-ahead test such
+    as the LSTM's."""
+    ts = np.asarray(timeseries.dropna(), dtype=float)
+    n = int(len(ts) * train_share)
+    if n < 1 or n >= len(ts):
+        return np.nan
+    return 100 - accuracy_metrics(ts[n - 1:-1], ts[n:])[2]
 
 
 def accuracy_metrics(forecast, test):

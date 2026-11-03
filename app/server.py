@@ -29,6 +29,14 @@ the same fixed-lag rule as the SARIMA differencing step.
 
 Batch forecast / download: a model failing for one KPI no longer empties
 the whole file, and the Excel file is built before it is sent.
+
+Evaluation: SARIMA future forecasts use the model refitted on the whole
+series; accuracies are shown next to a no-model baseline.
+
+LSTM rework (see lstm_model.py): it now models month-to-month differences,
+is tested over the whole test period like SARIMA (same split, same
+"same month last year" baseline), and is back in the "most accurate"
+pick. All LSTM code paths go through lstm_model.evaluate_and_forecast.
 """
 
 from shiny import reactive, render, ui
@@ -79,6 +87,8 @@ READ_ONLY = os.environ.get("TSF_READ_ONLY", "0") == "1"
 SARIMA_COLUMNS = ["KPI", "p", "d", "q", "P", "D", "Q"]
 LSTM_COLUMNS = ["KPI", "Layers", "Units", "Optimizer", "Sequence length",
                 "Epochs", "Batch size", "Verbose", "Validation split"]
+
+DEFAULT_HORIZON = 12  # months, when the prediction time box is empty
 
 
 # Load the kpi.ods file
@@ -180,6 +190,14 @@ def create_server():
             if df is None or selected_column is None or selected_column == "":
                 return None
             return df[selected_column]
+
+
+        # Prediction time from the Model tab, DEFAULT_HORIZON if empty
+        def _horizon():
+            horizon = input.predictionHorizon()
+            if horizon is None or horizon == "" or horizon < 1:
+                return DEFAULT_HORIZON
+            return int(horizon)
 
 
         # Time series plot
@@ -568,18 +586,19 @@ def create_server():
                           )
                        )
             if input.model_params() and input.model_choice() == "lstm":
+                d = lstm_model.DEFAULTS
                 return ui.div(
                           ui.row(
-                              ui.column(3, ui.input_numeric("layers", "Number of LSTM layers", value=2)),
-                              ui.column(3, ui.input_numeric("units", "Number of units per layer", value=10)),
-                              ui.column(3, ui.input_select("optimizer", "Optimizer", choices={"adam": "adam", "nadam": "nadam", "rmsprop": "RMSprop", "sgd": "sgd", "adagrad": "adagrad"})),
-                              ui.column(3, ui.input_numeric("seq_length", "Sequence length", value=12)),
+                              ui.column(3, ui.input_numeric("layers", "Number of LSTM layers", value=d["nb_layers"], min=1, max=3)),
+                              ui.column(3, ui.input_numeric("units", "Number of units per layer", value=d["nb_units"], min=1)),
+                              ui.column(3, ui.input_select("optimizer", "Optimizer", choices={"adam": "adam", "nadam": "nadam", "rmsprop": "RMSprop", "sgd": "sgd", "adagrad": "adagrad"}, selected=d["optimizer"])),
+                              ui.column(3, ui.input_numeric("seq_length", "Sequence length (months)", value=d["look_back"], min=1)),
                           ),
                           ui.row(
-                              ui.column(3, ui.input_numeric("epoch", "Epochs", value=50)),
-                              ui.column(3, ui.input_numeric("batchsize", "Batch size", value=16)),
-                              ui.column(3, ui.input_slider("verbose", "Verbose", min=0, max=2, value=1)),
-                              ui.column(3, ui.input_slider("validation_split", "Validation split", min=0, max=1, value=0.2)),
+                              ui.column(3, ui.input_numeric("epoch", "Maximum epochs (early stopping)", value=d["epochs"], min=1)),
+                              ui.column(3, ui.input_numeric("batchsize", "Batch size", value=d["batch_size"], min=1)),
+                              ui.column(3, ui.input_slider("verbose", "Verbose", min=0, max=2, value=d["verbose"])),
+                              ui.column(3, ui.input_slider("validation_split", "Validation split", min=0, max=0.5, value=d["validation_split"])),
                           ),
                           ui.div(ui.input_action_button("train_model_btn", "Train"), style="text-align: center;")
                        )
@@ -657,21 +676,17 @@ def create_server():
             return sarima_model.select_orders(train, residual)
 
 
-        # LSTM settings for a KPI: defaults, overridden by saved ones if complete.
-        # Batch size 16 (was 1): ~16x fewer weight updates per epoch, so the
-        # default model trains in seconds instead of minutes on a server CPU.
-        # Training blocks the user's session, so a slow default froze the
-        # Forecast tab (download/show forecast) until it finished.
-        # Verbose 0: no per-epoch logging in the server log.
+        # LSTM settings for a KPI: lstm_model.DEFAULTS, overridden by the
+        # saved ones (kpi.ods, LSTM sheet) if complete. Keys are the keyword
+        # arguments of lstm_model.evaluate_and_forecast.
         def _lstm_settings(kpi, use_saved):
-            settings = dict(nb_layers=2, nb_units=10, optimizer='RMSprop', look_back=12,
-                            epoch=100, batchsize=16, Verbose=0, Validationsplit=0.2)
+            settings = dict(lstm_model.DEFAULTS)
             saved = saved_params("LSTM", kpi) if use_saved else None
             if saved is not None:
                 s_layers, s_units, s_opt, s_lb, s_epoch, s_bs, s_verbose, s_vs = saved
                 settings.update(nb_layers=int(s_layers), nb_units=int(s_units), optimizer=s_opt,
-                                look_back=int(s_lb), epoch=int(s_epoch), batchsize=int(s_bs),
-                                Verbose=int(s_verbose), Validationsplit=float(s_vs))
+                                look_back=int(s_lb), epochs=int(s_epoch), batch_size=int(s_bs),
+                                verbose=int(s_verbose), validation_split=float(s_vs))
             return settings
 
 
@@ -754,71 +769,26 @@ def create_server():
             return fig
 
 
-        # Train the LSTM model
+        # Train the LSTM model: tested on the last 20% (multi-step, like
+        # SARIMA), then refitted on the whole series for the future values.
+        # Returns an lstm_model.LSTMResult, or None when no KPI is selected.
         @reactive.calc
         def lstm():
             df = selected_data()
-
             if df is None:
-                return (None,) * 11
+                return None
 
-            timeseries = df.dropna()
-            time_indices = timeseries.index
-            name = timeseries.name
-
-            # Reshaping the ts
-            timeseries = timeseries.values.reshape(-1, 1).astype('float32')
-
-            # User's entry
             if input.model_params() and input.train_model_btn():
-                epoch = input.epoch()
-                batchsize = input.batchsize()
-                Validationsplit = input.validation_split()
-                look_back = input.seq_length()
-                nb_layers = input.layers()
-                nb_units = input.units()
-                optimizer = input.optimizer()
-                Verbose = input.verbose()
-            # Saved parameters if ticked and complete, defaults otherwise
+                # The user's entries
+                settings = dict(nb_layers=input.layers(), nb_units=input.units(),
+                                optimizer=input.optimizer(), look_back=input.seq_length(),
+                                epochs=input.epoch(), batch_size=input.batchsize(),
+                                verbose=input.verbose(), validation_split=input.validation_split())
             else:
-                s = _lstm_settings(name, use_saved=input.saved_params())
-                nb_layers, nb_units, optimizer = s["nb_layers"], s["nb_units"], s["optimizer"]
-                look_back, epoch, batchsize = s["look_back"], s["epoch"], s["batchsize"]
-                Verbose, Validationsplit = s["Verbose"], s["Validationsplit"]
+                # Saved parameters if ticked and complete, defaults otherwise
+                settings = _lstm_settings(df.name, use_saved=input.saved_params())
 
-            # train/test split on RAW (unscaled) values first, so the
-            # scaler never sees the test window
-            train_size = int(len(timeseries) * 0.80)
-            raw_train = timeseries[0:train_size, :]
-            raw_test = timeseries[train_size-look_back-1:len(timeseries), :]
-
-            # Fit the scaler on the training split only
-            scaler, train = lstm_model.scaling(raw_train)
-            test = lstm_model.scale_transform(scaler, raw_test)
-            scaled_data = lstm_model.scale_transform(scaler, timeseries)
-
-            trainX, trainY, testX, testY = lstm_model.reshaping(train, test, look_back)
-
-            model = lstm_model.lstm_model(look_back, nb_layers, nb_units, optimizer)
-            lstm_model.lstm_training(model, trainX, trainY, epoch, batchsize, Verbose, Validationsplit)
-
-            # Predictions
-            trainPredict, testPredict, trainY, testY = lstm_model.lstm_prediction(model, trainX, testX, trainY, testY, scaler)
-            last_sequence = testX[-1]
-            horizon = input.predictionHorizon()
-            if horizon is None or horizon == "":
-                horizon = 1
-            horizon += 1
-            future_predictions = lstm_model.lstm_future_predictions(model, last_sequence, look_back, horizon, scaler)
-            future_time_indices = lstm_model.future_timeindices(time_indices, horizon)
-
-            # Visualize the result
-            trainPredictPlot, testPredictPlot, fig = lstm_model.visualize_predictions(scaled_data, look_back, time_indices, trainPredict, testPredict, scaler)
-
-            fig.add_trace(go.Scatter(x=future_time_indices, y=future_predictions.flatten(), mode='lines', name='Future values'))
-            fig.update_layout(title=f"LSTM model plot of {name}", xaxis_title='Date', yaxis_title=f"{name}", template='plotly_white')
-
-            return (model, trainY, testY, trainPredict, testPredict, time_indices, testX, testPredictPlot, fig, future_predictions, future_time_indices)
+            return lstm_model.evaluate_and_forecast(df, _horizon(), **settings)
 
 
         # LSTM predictions plot
@@ -827,9 +797,9 @@ def create_server():
             if input.model_choice() != "lstm":
                 return None
             result = lstm()
-            if any(v is None for v in result):
+            if result is None:
                 return go.Figure()
-            return result[8]
+            return lstm_model.result_figure(result)
 
 
         # Test results: test data vs test predictions
@@ -865,14 +835,13 @@ def create_server():
                 return ui.HTML(style_table(newdf.tail(10)))
 
             if modelchoice == "lstm":
-                (fitted_model, trainY, testY, trainPredict, testPredict, time_indices, testX, testPredictPlot, fig, future_predictions, future_time_indices) = lstm()
-                test_size = testY.shape[1]
+                result = lstm()
                 newdf = pd.DataFrame()
-                newdf["Date"] = time_indices[-test_size:]
-                newdf["Test data (y)"] = testY[0]
-                newdf["Test predictions (yhat)"] = testPredictPlot[-test_size:, 0]
+                newdf["Date"] = result.test.index
+                newdf["Test data (y)"] = result.test.values
+                newdf["Test predictions (yhat)"] = result.test_forecast.values
                 newdf["Error (y - yhat)"] = newdf["Test data (y)"] - newdf["Test predictions (yhat)"]
-                return ui.HTML(style_table(newdf.iloc[:-1, ].tail(10)))
+                return ui.HTML(style_table(newdf.tail(10)))
 
             return None
 
@@ -942,17 +911,17 @@ def create_server():
             return pd.DataFrame(metrics, index=[0]).round(2)
 
 
-        # LSTM accuracy on test data
+        # LSTM accuracy on test data: same metrics and same test months as SARIMA
         @reactive.calc
         def lstm_accuracy():
-            if selected_data() is None:
+            result = lstm()
+            if result is None:
                 return None
-            (fitted_model, trainY, testY, trainPredict, testPredict, time_indices, testX, testPredictPlot, fig, future_predictions, future_time_indices) = lstm()
-            trainScore, testScore = lstm_model.lstm_eval(fitted_model, trainY, trainPredict, testY, testPredict)
-            metrics = {"Mean Squared Error": testScore[0],
-                       "Root Mean Squared Error": testScore[1],
-                       "Mean Absolute Error": testScore[2],
-                       "Mean Absolute Percentage Error (%)": testScore[3]}
+            (mae, mse, mape) = sarima_model.accuracy_metrics(result.test_forecast, result.test)
+            metrics = {"Mean Squared Error": mse,
+                       "Root Mean Squared Error": m.sqrt(mse),
+                       "Mean Absolute Error": mae,
+                       "Mean Absolute Percentage Error (%)": mape}
             return pd.DataFrame(metrics, index=[0]).round(2)
 
 
@@ -1030,14 +999,28 @@ def create_server():
             return ui.TagList(error_message, homoscedasticity, autocorrelation)
 
 
-        def _accuracy_note(acc, prefix=""):
-            if acc < 80.0:
-                text = f"{prefix}ccuracy is really low, consider changing parameters to improve it or choose a model with better accuracy."
-            elif acc > 95.0:
-                text = "Accuracy is very high, predictions are reliable."
+        # Compare the model's accuracy with a forecast that needs no model.
+        # On slowly changing KPIs, 100 - MAPE is high even for a naive
+        # forecast, so "95% accurate" only means something next to this.
+        # SARIMA and LSTM are tested on exactly the same months as this
+        # reference; Prophet by cross-validation (approximate comparison).
+        def _baseline_note(acc):
+            ts = selected_data()
+            model = input.model_choice()
+            base = sarima_model.seasonal_naive_accuracy(ts)
+            label = "Repeating the same month of last year scores {:.1f}% on the last 20% of the data"
+            label += (" (Prophet is tested by cross-validation, so this comparison is approximate)."
+                      if model == "prophet" else ", the same test months.")
+            if pd.isna(base):
+                return None
+            gain = acc - base
+            if gain >= 2:
+                verdict = f"The model does better than this reference, by {gain:.1f} points."
+            elif gain > -2:
+                verdict = "The model does about as well as this reference, so it adds little."
             else:
-                text = "Accuracy is good but can maybe be improved by changing parameters."
-            return ui.HTML(f'<div style="text-align: center; color: #696969;">{text}</div>')
+                verdict = f"The model does worse than this reference, by {-gain:.1f} points: try other parameters or another model."
+            return ui.HTML(f'<div style="text-align: center; color: #696969;">Reference: {label.format(base)} {verdict}</div>')
 
 
         @render.ui
@@ -1046,14 +1029,16 @@ def create_server():
             if acc is None:
                 return None
 
-            valid = ui.HTML('<div style="text-align: center; color: #696969;">Model is valid</div>')
+            note = _baseline_note(acc)
             if input.model_choice() == "sarima":
                 if hm == "Yes" and ac == "No":
-                    return ui.TagList(valid, _accuracy_note(acc, prefix="A"))
+                    valid = ui.HTML('<div style="text-align: center; color: #696969;">Model is valid</div>')
+                    return ui.TagList(valid, note)
                 invalid = ui.HTML('<div style="text-align: center; color: #696969;">Model is not valid</div>')
                 advice = ui.HTML('<div style="text-align: center; color: #696969;">Change parameters until homoscedasticity is achieved or residuals are no longer autocorrelated. Or consider changing model altogether.</div>')
-                return ui.TagList(invalid, advice)
-            return ui.TagList(valid, _accuracy_note(acc, prefix="But a"))
+                return ui.TagList(invalid, advice, note)
+            # No residual tests are run for Prophet and LSTM, so no validity claim
+            return ui.TagList(note)
 
 
         # Information icon next to the selected KPI
@@ -1100,25 +1085,29 @@ def create_server():
                 return pd.DataFrame()
 
             timeseries = df.dropna()
-            horizon = input.predictionHorizon()
+            horizon = _horizon()
 
+            # Same orders as the Model tab, refitted on the whole series
             sarima_fitted_model, _, _, _ = sarima()
-            sarima_previsions = sarima_fitted_model.predict(start=0, end=len(timeseries)+horizon)
-            index = sarima_previsions.index[:-1]
+            (p, d, q) = sarima_fitted_model.model.order
+            (P, D, Q, _s) = sarima_fitted_model.model.seasonal_order
+            sarima_future = sarima_model.future_forecast(timeseries, p, d, q, P, D, Q, horizon)
 
             prophet_fitted_model, scaler = prophet_model.prophet_training(timeseries)
             prophet_forecast = prophet_model.prophet_forecasting(prophet_fitted_model, horizon, scaler)
 
             try:
-                future_predictions = lstm()[9]
-                lstm_forecast = future_predictions[:, 0][-horizon:]
+                lstm_forecast = lstm().future.values[:horizon]
             except lstm_model.TensorFlowUnavailableError:
                 # TensorFlow cannot load on this machine: keep SARIMA/Prophet
                 lstm_forecast = np.full(horizon, np.nan)
+            except ValueError:
+                # Series too short for the LSTM's sequence length
+                lstm_forecast = np.full(horizon, np.nan)
 
             new_df = pd.DataFrame()
-            new_df["Date"] = index[-horizon:]
-            new_df["SARIMA"] = sarima_previsions[-horizon:].values
+            new_df["Date"] = sarima_future.index
+            new_df["SARIMA"] = sarima_future.values
             new_df["Prophet"] = prophet_forecast['yhat'][-horizon:].values
             new_df["LSTM"] = lstm_forecast
             return new_df.round(2)
@@ -1133,7 +1122,7 @@ def create_server():
         def _lstm_mape():
             try:
                 return _mape(lstm_accuracy())
-            except lstm_model.TensorFlowUnavailableError:
+            except (lstm_model.TensorFlowUnavailableError, ValueError):
                 return np.nan
 
 
@@ -1174,11 +1163,18 @@ def create_server():
                 return None
             def _display(mape):
                 return "unavailable" if pd.isna(mape) else 100 - mape
+            baseline = sarima_model.seasonal_naive_accuracy(selected_data())
             acc = {"Accuracy": "%",
                    "SARIMA": _display(_mape(sarima_accuracy())),
                    "Prophet": _display(_mape(prophet_accuracy())),
-                   "LSTM": _display(_lstm_mape())}
-            return ui.HTML(style_table(pd.DataFrame(acc, index=[0])))
+                   "LSTM": _display(_lstm_mape()),
+                   "Same month last year": "unavailable" if pd.isna(baseline) else baseline}
+            note = ui.div("Each model is tested on recent data it hasn't seen (SARIMA, LSTM and the "
+                          "reference on the last 20% of the data, Prophet by cross-validation). "
+                          "\"Same month last year\" is a forecast with no model at all: a model is "
+                          "only useful if it clearly beats it.",
+                          style="color: #696969; font-size: 0.85rem;")
+            return ui.TagList(ui.HTML(style_table(pd.DataFrame(acc, index=[0]))), note)
 
 
         # Plot of all models' predictions
@@ -1232,9 +1228,8 @@ def create_server():
                 (trend, seasonal, residual) = sarima_model.series_decompose(train)
                 p, d, q, P, D, Q = _sarima_orders(kpi, train, residual)
 
-                sarima_fitted_model = sarima_model.sarima_training(train, p, d, q, P, D, Q)
-                sarima_previsions = sarima_fitted_model.predict(start=0, end=len(timeseries)+horizon)
-                return sarima_previsions[-horizon:].values
+                # Orders chosen on the training split, model refitted on all the data
+                return sarima_model.future_forecast(timeseries, p, d, q, P, D, Q, horizon).values
 
             if selected_model == "Prophet":
                 prophet_fitted_model, scaler = prophet_model.prophet_training(timeseries)
@@ -1242,26 +1237,11 @@ def create_server():
                 return prophet_previsions['yhat'][-horizon:].values
 
             if selected_model == "LSTM":
-                values = timeseries.values.reshape(-1, 1).astype('float32')
-
-                # Defaults, overridden by saved ones for this KPI
-                s = _lstm_settings(kpi, use_saved=True)
-                look_back = s["look_back"]
-
-                # Split raw values first, fit the scaler on train only
-                raw_train = values[0:train_size, :]
-                raw_test = values[train_size-look_back-1:len(values), :]
-                scaler, train = lstm_model.scaling(raw_train)
-                test = lstm_model.scale_transform(scaler, raw_test)
-
-                trainX, trainY, testX, testY = lstm_model.reshaping(train, test, look_back)
-
-                model = lstm_model.lstm_model(look_back, s["nb_layers"], s["nb_units"], s["optimizer"])
-                lstm_model.lstm_training(model, trainX, trainY, s["epoch"], s["batchsize"], s["Verbose"], s["Validationsplit"])
-
-                last_sequence = testX[-1]
-                future_predictions = lstm_model.lstm_future_predictions(model, last_sequence, look_back, horizon + 1, scaler)
-                return future_predictions[:, 0][-horizon:]
+                # Defaults, overridden by saved ones for this KPI.
+                # Same procedure as the Model tab: the test run picks the
+                # number of epochs, then the model is refitted on all the data.
+                settings = _lstm_settings(kpi, use_saved=True)
+                return lstm_model.evaluate_and_forecast(timeseries, horizon, **settings).future.values
 
             raise ValueError(f"unknown model {selected_model!r}")
 
@@ -1277,18 +1257,14 @@ def create_server():
                 return pd.DataFrame(), {}
 
             selected_kpis = input.selected_kpis()
-            horizon = input.predictionHorizon()
-            if horizon is None or horizon == "" or horizon < 1:
-                horizon = 12
-            horizon = int(horizon)
+            horizon = _horizon()
 
             predictions = pd.DataFrame()
             failures = {}
             for kpi in selected_kpis:
                 selected_model = input[f"model_{_kpi_id(kpi)}"]()
                 timeseries = df[kpi].dropna()
-                future_time_indices = lstm_model.future_timeindices(timeseries.index, horizon+1)
-                predictions["Date"] = future_time_indices[-horizon:]
+                predictions["Date"] = sarima_model.next_months(timeseries.index[-1], horizon)
                 try:
                     predictions[kpi] = _forecast_kpi(kpi, selected_model, timeseries, horizon)
                 except Exception as e:
@@ -1413,7 +1389,7 @@ def create_server():
                           ui.br(),
                           ui.row(
                               ui.column(4, ui.input_select("model_choice", "Choose a model:", choices={"sarima": "SARIMA", "prophet": "Prophet", "lstm": "LSTM"})),
-                              ui.column(4, ui.input_numeric("predictionHorizon", "Prediction time (in months)", value=12)),
+                              ui.column(4, ui.input_numeric("predictionHorizon", "Prediction time (in months)", value=DEFAULT_HORIZON)),
                           ),
 
                           ui.row(
