@@ -22,6 +22,19 @@ Stationarity / differencing fix:
   no upper limit. It now stops at d = 2 (more is never useful for SARIMA).
 - A test that cannot run on a series no longer crashes the app: it simply
   doesn't count as evidence of stationarity.
+
+Order selection fix (SARIMA was very slow):
+- p and q counted EVERY significant lag of the undifferenced series, while
+  the comment said "take the first significant lag". On a trending series
+  almost every lag is significant, so q reached 8-10. They are now read
+  on the series differenced d times, as the number of consecutive
+  significant lags from lag 1 (where the PACF / ACF cuts off), capped at 3.
+- P and Q were read from lags 1-15 of the decomposition residuals, not at
+  the seasonal lag. They are now 1 if the PACF / ACF of the differenced
+  series is significant at lag 12, else 0. D (from the residuals) is
+  capped at 1.
+- Typical result: SARIMA(1,1,1)(1,0,1,12) instead of SARIMA(1,1,9)(4,0,1,12),
+  which fits in seconds instead of minutes and overfits far less.
 """
 import pandas as pd
 import numpy as np
@@ -43,7 +56,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 #import itertools
 
 
-MAX_D = 2  # maximum order of differencing tried by differencing()
+MAX_D = 2           # maximum order of differencing tried by differencing()
+MAX_PQ = 3          # maximum non-seasonal AR / MA order
+SEASON = 12         # monthly data: yearly seasonality
 
 
 def pacf_plot(timeseries):
@@ -94,11 +109,11 @@ def series_decompose(timeseries):
     return (trend,seasonal,residual)
 
 
-def acf_pacf_values(timeseries):
+def acf_pacf_values(timeseries, max_lags=15):
     sample_size = len(timeseries.dropna())
     max_nlags = (sample_size // 2) - 1
     # Set nlags to a valid value
-    nlags = min(15, max_nlags)
+    nlags = min(max_lags, max_nlags)
     acf_values, acf_confint = acf(timeseries.dropna(), alpha=0.05, nlags=nlags, fft=False)
     pacf_values, pacf_confint = pacf(timeseries.dropna(), alpha=0.05, nlags=nlags)
     return (acf_values, acf_confint, pacf_values, pacf_confint)
@@ -173,31 +188,62 @@ def differencing(timeseries, max_d=MAX_D):
 #    return (newp,newd,newq)
 
 
+def _significant(values, confint):
+    # statsmodels returns confidence intervals centred on each value;
+    # the band around zero has the same half-width
+    half_width = confint[:, 1] - values
+    return np.abs(values) > half_width
+
+
+def _cutoff(significant, max_order):
+    # Number of consecutive significant lags starting at lag 1, i.e. the
+    # lag after which the (P)ACF cuts off
+    order = 0
+    for lag in range(1, len(significant)):
+        if not significant[lag] or order == max_order:
+            break
+        order += 1
+    return order
+
+
+def _difference(timeseries, d):
+    ts = timeseries.dropna()
+    for _ in range(d):
+        ts = ts.diff().dropna()
+    return ts
+
+
 def select_pdq(timeseries):
-    #model = pm.auto_arima(timeseries, seasonal=False, trace=True, error_action='ignore', suppress_warnings=True)
-    # Calculate ACF and PACF
-    (acf_values, acf_confint, pacf_values, pacf_confint) = acf_pacf_values(timeseries)
-    nb_lags = np.arange(len(acf_values))
-
-    # Identify cut-off lags for p and q
-    confint_inf_acf = acf_confint[:, 0] - acf_values
-    confint_sup_acf = acf_confint[:, 1] - acf_values
-    confint_inf_pacf = pacf_confint[:, 0] - pacf_values
-    confint_sup_pacf = pacf_confint[:, 1] - pacf_values
-
-    significant_acf_lags = []
-    significant_pacf_lags = []
-    for i in nb_lags:
-        if acf_values[i] > confint_sup_acf[i] or acf_values[i] < confint_inf_acf[i]:
-            significant_acf_lags.append(i)
-        if pacf_values[i] > confint_sup_pacf[i] or pacf_values[i] < confint_inf_pacf[i]:
-            significant_pacf_lags.append(i)
-
-    # Typically, we take the first significant lag as p or q
-    p = len(significant_pacf_lags)-1 if len(significant_pacf_lags) <= 10 else 10
-    q = len(significant_acf_lags)-1 if len(significant_acf_lags) <= 10 else 10
+    # d first, then p and q on the series made stationary by differencing:
+    # on the raw series a trend makes nearly every lag look significant
     d = differencing(timeseries)
-    return (p,d,q)
+    stationary = _difference(timeseries, d)
+    (acf_values, acf_confint, pacf_values, pacf_confint) = acf_pacf_values(stationary)
+    p = _cutoff(_significant(pacf_values, pacf_confint), MAX_PQ)
+    q = _cutoff(_significant(acf_values, acf_confint), MAX_PQ)
+    return (p, d, q)
+
+
+def select_seasonal_pdq(timeseries, residual, d):
+    # D: same stationarity check as before, on the decomposition residuals,
+    # but at most one seasonal difference
+    D = min(differencing(residual), 1)
+    # P and Q: is the seasonal lag (12) significant on the differenced series?
+    stationary = _difference(timeseries, d)
+    (acf_values, acf_confint, pacf_values, pacf_confint) = acf_pacf_values(stationary, max_lags=SEASON)
+    if len(acf_values) <= SEASON:
+        return (0, D, 0)  # too short to see a full season
+    P = int(_significant(pacf_values, pacf_confint)[SEASON])
+    Q = int(_significant(acf_values, acf_confint)[SEASON])
+    return (P, D, Q)
+
+
+def select_orders(train, residual):
+    """Automatic SARIMA orders (p, d, q, P, D, Q) for a training series and
+    the residuals of its seasonal decomposition."""
+    (p, d, q) = select_pdq(train)
+    (P, D, Q) = select_seasonal_pdq(train, residual, d)
+    return (p, d, q, P, D, Q)
 
 
 def sarima_training(timeseries, p, d, q, P, D, Q):

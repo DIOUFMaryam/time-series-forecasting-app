@@ -651,9 +651,7 @@ def create_server():
             saved = saved_params("SARIMA", kpi)
             if saved is not None:
                 return tuple(int(v) for v in saved)
-            (p, d, q) = sarima_model.select_pdq(train)
-            (P, D, Q) = sarima_model.select_pdq(residual)
-            return (p, d, q, P, D, Q)
+            return sarima_model.select_orders(train, residual)
 
 
         # LSTM settings for a KPI: defaults, overridden by saved ones if complete.
@@ -693,8 +691,7 @@ def create_server():
             elif input.saved_params():
                 p, d, q, P, D, Q = _sarima_orders(timeseries.name, train, residual)
             else:
-                (p, d, q) = sarima_model.select_pdq(train)
-                (P, D, Q) = sarima_model.select_pdq(residual)
+                p, d, q, P, D, Q = sarima_model.select_orders(train, residual)
 
             horizon = input.predictionHorizon()
             if horizon is None or horizon == "":
