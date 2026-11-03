@@ -42,6 +42,24 @@ Each KPI is designed to exercise a different part of the diagnosis and models:
 
 To use your own data, drop an `.xlsx` file in `files/` with dates in the first column and one numeric column per KPI (monthly frequency). KPI descriptions and saved model parameters are optional: KPIs missing from `kpi.ods` simply use default parameters.
 
+## How accuracy is measured (and why 95% isn't necessarily good)
+
+The app reports *accuracy = 100 - MAPE* on the most recent 20% of each series, which the model hasn't seen. SARIMA and the LSTM are tested the same way: trained on the first 80%, then asked to forecast the whole test period from its start, without seeing any of its actual values.
+
+On KPIs that are large and change slowly, this number is high even for forecasts that use no model at all. On the demo data, repeating the last known value for the whole test period scores 95-99% on most KPIs. So every accuracy is shown next to a **baseline**: **same month last year**, scored on the same test months. A model is only useful if it clearly beats it.
+
+Prophet is scored by cross-validation, so its comparison with the baseline is approximate.
+
+## How the LSTM forecasts
+
+A neural network is easy to make look good and hard to make useful on ~100 monthly points. The design choices in `app/lstm_model.py`:
+
+- **It learns month-to-month changes, not levels.** A model trained on levels has to extrapolate beyond the range it was scaled on as soon as the KPI keeps growing, and its recursive forecasts drift to a flat line. The predicted changes are added back to the last known value. The scaler is fit on the training changes only.
+- **A small network**: one LSTM layer of 8 units, MAE loss, early stopping on the most recent training months (best weights kept). Bidirectional layers were dropped: reading the sequence backwards makes no sense when forecasting the next value.
+- **Tested like SARIMA** (see above), so its score is comparable and it takes part in the "most accurate model" pick.
+- **Future values come from a model retrained on the whole series**, for the number of epochs early stopping chose on the test run.
+- **Seeded**, so the same data and settings give the same numbers on every run.
+
 ## Project structure
 
 ```
@@ -52,7 +70,7 @@ TSF/
 │   ├── server.py          # reactive logic, diagnostics, model orchestration
 │   ├── sarima_model.py     # SARIMA fitting, stationarity tests, ACF/PACF
 │   ├── prophet_model.py    # Prophet fitting, forecasting, cross-validation
-│   ├── lstm_model.py       # LSTM data prep, training, forecasting
+│   ├── lstm_model.py       # LSTM on differences: training, multi-step test, forecast
 │   └── requirements.txt
 ├── scripts/
 │   └── generate_synthetic_kpis.py   # builds files/telecom_kpis_synthetic.xlsx and kpi.ods
@@ -115,9 +133,10 @@ Problems hit while getting this app running again on a fresh Windows machine, an
 
 - **LSTM on Windows 11 with Smart App Control**: TensorFlow can be blocked (see Troubleshooting). The rest of the app works without it.
 - **Pinned, ageing stack**: the pins keep the app on Python 3.9-3.11, numpy 1.24 and Prophet 1.1.5. The Shiny upgrade is done; the remaining plan is pandas/statsmodels, then Prophet and TensorFlow (TensorFlow 2.16+ switches to Keras 3, so the LSTM code will need retesting).
-- **LSTM is trained from scratch per request**: there's no caching, so switching KPIs retrains the model live, and the rest of that visitor's session waits while it trains (the default settings keep this to seconds; larger custom settings make it longer). Fine for a demo/internal tool, not for production latency.
+- **LSTM is trained from scratch per request**, twice (test run, then whole series): there's no caching, so switching KPIs retrains the model live, and the rest of that visitor's session waits while it trains (the small default network keeps this to seconds; larger custom settings make it longer). Fine for a demo/internal tool, not for production latency.
 - **Single-series models only**: each KPI is forecast independently; no cross-series (multivariate) modeling.
 - **Monthly data only**: horizons, seasonal periods and forecast dates assume one observation per month.
+- **Missing values in the middle of a series are dropped**, which joins non-consecutive months together for every model. Interpolation is the planned fix.
 - **The LSTM is never the recommended model on monthly data**: the recommendation needs 1,000+ observations for LSTM, i.e. 80+ years of monthly history. It can still be selected manually.
 - **No automated tests**: diagnostics and metrics are validated visually in the app, not with a test suite.
 
@@ -128,7 +147,17 @@ A few correctness issues found on review, since fixed in this repo:
 - **MAPE division-by-zero**: KPI series with zero-valued periods could produce `inf`/`nan` MAPE. Zero-actual points are now excluded from the MAPE calculation instead of silently corrupting it.
 - **Prophet cross-validation windows**: were hardcoded in days (`366/180/180`) regardless of how much history a given KPI actually had. Windows are now scaled to each series' own date range.
 
+LSTM reworked (see "How the LSTM forecasts"):
+- **Its 90%+ accuracy was an easy test**: each test month was predicted from the *actual* previous months, a test that copying last month's value also passes with 96-99%. Its future forecast, fed with its own outputs instead, came out flat. It is now tested over the whole test period from its start, like SARIMA, and scored against the same baseline.
+- **It modelled levels**: it now models month-to-month changes, so a trend no longer pushes it outside the range it was trained on.
+- **Oversized network for the data**: two bidirectional layers of 10 units trained for a fixed 100 epochs became one layer of 8 units with early stopping.
+- **Future values ignored the most recent data**: like SARIMA's used to, they now come from a model retrained on the whole series.
+- **Scaled predictions were rounded to 2 decimals** inside the forecast loop, before being converted back to KPI units, which made forecasts move in steps.
+
 Fixed while moving to the public synthetic dataset:
+- **SARIMA test shifted by one month**: the test forecast dropped its first step, so each forecast was compared with the previous month's actual value (the training fit in the plot had the same shift).
+- **SARIMA future forecasts ignored the most recent data**: they came from the model fitted on the first 80% of the series, so they started two years before the last observation. The model is now refitted on the whole series before forecasting, in the Model tab plot, the Forecast tab comparison and the Excel export.
+- **Misleading accuracy messages**: "Accuracy is very high, predictions are reliable" (above 95%) is replaced by a comparison with a no-model baseline (see "How accuracy is measured"), and Prophet and LSTM are no longer labelled "valid" since no residual tests are run for them.
 - **Empty forecast download**: the Excel file was written inside a generator, which only runs while the file is being sent. If any selected model failed at that point (for example LSTM when TensorFlow can't load), the transfer was cut and the browser saved an empty file with no message. The file is now built before it is sent, a KPI whose model fails gets an empty column plus an on-screen warning, and the other KPIs are still forecast.
 - **SARIMA order selection (very slow fits)**: `p` and `q` counted *every* significant lag of the undifferenced series (the code comment said "take the first significant lag"), so a trend pushed `q` to 8-10, and `P`/`Q` were read from non-seasonal lags of the residuals. Orders are now read on the differenced series, where the ACF/PACF cuts off (capped at 3), with `P`/`Q` set from lag 12. Typical result: SARIMA(1,1,1)(1,0,1,12) instead of SARIMA(1,1,9)(4,0,1,12), which fits in seconds instead of minutes and overfits far less.
 - **SARIMA order selection crash** ("Residuals are all zero and so automatic bandwidth selection cannot be used"): to pick `d`, the series was differenced until the stationarity tests agreed, with no limit. Once over-differenced, KPSS's automatic lag selection estimates a negative long-run variance and `arch` raises an error. KPSS now uses a fixed number of lags (whose estimate can't be negative), `d` is capped at 2, and a test that can't run no longer crashes the app. The Data tab's stationarity verdict uses the same function.
@@ -149,7 +178,7 @@ Fixed while getting the app running again:
 
 Migrated to Shiny for Python 1.x (previously pinned to 0.6.1.1):
 - **Layout and API**: `ui.panel_sidebar`/`ui.panel_main` → `ui.sidebar` inside `ui.layout_sidebar`; `ui.nav` → `ui.nav_panel`; `@reactive.Calc`/`@reactive.Effect` → `@reactive.calc`/`@reactive.effect`; `@session.download` → `@render.download`; `@output` decorators removed.
-- **TensorFlow 2.13.1 → 2.14.1** to resolve the `typing_extensions` conflict with Shiny 1.x. 2.14 keeps the same Keras API, so the LSTM code is unchanged.
+- **TensorFlow 2.13.1 → 2.14.1** to resolve the `typing_extensions` conflict with Shiny 1.x. 2.14 keeps the same Keras API.
 - **Excel download** now writes with `openpyxl` (it used `xlsxwriter`, which was never in `requirements.txt`, so the button failed).
 - **Parameter checkboxes**: ticking "Use saved parameters" while "Choose model parameters" was ticked immediately unticked the box just clicked; the two now switch cleanly.
 - **Batch forecast with LSTM** loaded the saved parameters of the KPI selected in the sidebar instead of each KPI being forecast.
