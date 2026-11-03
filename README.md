@@ -42,13 +42,13 @@ Each KPI is designed to exercise a different part of the diagnosis and models:
 
 To use your own data, drop an `.xlsx` file in `files/` with dates in the first column and one numeric column per KPI (monthly frequency). KPI descriptions and saved model parameters are optional: KPIs missing from `kpi.ods` simply use default parameters.
 
-## How accuracy is measured (and why 95% isn't necessarily good)
+## How models are scored (and why "95% accurate" meant little)
 
-The app reports *accuracy = 100 - MAPE* on the most recent 20% of each series, which the model hasn't seen. SARIMA and the LSTM are tested the same way: trained on the first 80%, then asked to forecast the whole test period from its start, without seeing any of its actual values.
+Each model is scored by its **average percentage error (MAPE)** on the most recent 20% of the series, which it hasn't seen. SARIMA and the LSTM are tested the same way: trained on the first 80%, then asked to forecast the whole test period from its start, without seeing any of its actual values.
 
-On KPIs that are large and change slowly, this number is high even for forecasts that use no model at all. On the demo data, repeating the last known value for the whole test period scores 95-99% on most KPIs. So every accuracy is shown next to a **baseline**: **same month last year**, scored on the same test months. A model is only useful if it clearly beats it.
+An earlier version showed *accuracy = 100 - MAPE*. On KPIs that are large and change slowly, that number is high even for forecasts that use no model at all: on the demo data, repeating the last known value for the whole test period scores 95-99% on most KPIs. So the error is now always shown next to the error of a **baseline**, **same month last year**, scored on the same test months, with a plain verdict: "18% smaller error than the reference: the model adds value", "about the same error", or "larger error". A model is only useful if its error is clearly smaller.
 
-Prophet is scored by cross-validation, so its comparison with the baseline is approximate.
+Prophet is scored by cross-validation, so its comparison with the baseline is approximate. SARIMA also gets two residual checks (Breusch-Pagan, Ljung-Box), shown as "the errors have a constant spread" and "no pattern left in the errors".
 
 ## How the LSTM forecasts
 
@@ -56,7 +56,7 @@ A neural network is easy to make look good and hard to make useful on ~100 month
 
 - **It learns month-to-month changes, not levels.** A model trained on levels has to extrapolate beyond the range it was scaled on as soon as the KPI keeps growing, and its recursive forecasts drift to a flat line. The predicted changes are added back to the last known value. The scaler is fit on the training changes only.
 - **A small network**: one LSTM layer of 8 units, MAE loss, early stopping on the most recent training months (best weights kept). Bidirectional layers were dropped: reading the sequence backwards makes no sense when forecasting the next value.
-- **Tested like SARIMA** (see above), so its score is comparable and it takes part in the "most accurate model" pick.
+- **Tested like SARIMA** (see "How models are scored"), so its score is comparable and it takes part in the "most accurate model" pick.
 - **Future values come from a model retrained on the whole series**, for the number of epochs early stopping chose on the test run.
 - **Seeded**, so the same data and settings give the same numbers on every run.
 
@@ -73,7 +73,8 @@ TSF/
 │   ├── lstm_model.py       # LSTM on differences: training, multi-step test, forecast
 │   └── requirements.txt
 ├── scripts/
-│   └── generate_synthetic_kpis.py   # builds files/telecom_kpis_synthetic.xlsx and kpi.ods
+│   ├── generate_synthetic_kpis.py   # builds files/telecom_kpis_synthetic.xlsx and kpi.ods
+│   └── check_sarima.py              # SARIMA on every demo KPI: model, errors, flat or not
 ├── files/                 # .xlsx files the app lists and lets users pick
 ├── kpi.ods                # KPI descriptions + saved per-KPI model parameters
 ├── Documentation.md       # user guide, also shown in the app's Documentation tab
@@ -147,6 +148,11 @@ A few correctness issues found on review, since fixed in this repo:
 - **MAPE division-by-zero**: KPI series with zero-valued periods could produce `inf`/`nan` MAPE. Zero-actual points are now excluded from the MAPE calculation instead of silently corrupting it.
 - **Prophet cross-validation windows**: were hardcoded in days (`366/180/180`) regardless of how much history a given KPI actually had. Windows are now scaled to each series' own date range.
 
+SARIMA forecasts flat on five of the eight KPIs:
+- **No constant**: `SARIMAX` has no intercept unless asked. With one difference that means no drift, so a trending KPI (ARPU) was forecast flat; without differencing, the AR terms had to mimic the mean and ended up close to a random walk (churn). The model now includes a mean when nothing is differenced and a drift when the series is differenced once, the same rule as R's `auto.arima`.
+- **The seasonal difference was never used**: `D` was chosen by testing the *residuals of the seasonal decomposition* for stationarity, but the residuals are what is left once seasonality is removed, so `D` was always 0. It is now 1 when the seasonal strength is above 0.64 (Hyndman & Athanasopoulos' rule), measured on the log scale (seasonal swings that grow with the level) with a spike-resistant spread (outages).
+- **The seasonal lag was rarely judged significant**: `P`/`Q` were read against Bartlett's confidence band, which widens with every lag. Lag 12 is now compared with the white-noise band `1.96/√n`.
+
 LSTM reworked (see "How the LSTM forecasts"):
 - **Its 90%+ accuracy was an easy test**: each test month was predicted from the *actual* previous months, a test that copying last month's value also passes with 96-99%. Its future forecast, fed with its own outputs instead, came out flat. It is now tested over the whole test period from its start, like SARIMA, and scored against the same baseline.
 - **It modelled levels**: it now models month-to-month changes, so a trend no longer pushes it outside the range it was trained on.
@@ -157,7 +163,7 @@ LSTM reworked (see "How the LSTM forecasts"):
 Fixed while moving to the public synthetic dataset:
 - **SARIMA test shifted by one month**: the test forecast dropped its first step, so each forecast was compared with the previous month's actual value (the training fit in the plot had the same shift).
 - **SARIMA future forecasts ignored the most recent data**: they came from the model fitted on the first 80% of the series, so they started two years before the last observation. The model is now refitted on the whole series before forecasting, in the Model tab plot, the Forecast tab comparison and the Excel export.
-- **Misleading accuracy messages**: "Accuracy is very high, predictions are reliable" (above 95%) is replaced by a comparison with a no-model baseline (see "How accuracy is measured"), and Prophet and LSTM are no longer labelled "valid" since no residual tests are run for them.
+- **Misleading accuracy messages**: "Accuracy is very high, predictions are reliable" (above 95%) is replaced by the average error next to a no-model baseline's (see "How models are scored"), and Prophet and LSTM are no longer labelled "valid" since no residual tests are run for them.
 - **Empty forecast download**: the Excel file was written inside a generator, which only runs while the file is being sent. If any selected model failed at that point (for example LSTM when TensorFlow can't load), the transfer was cut and the browser saved an empty file with no message. The file is now built before it is sent, a KPI whose model fails gets an empty column plus an on-screen warning, and the other KPIs are still forecast.
 - **SARIMA order selection (very slow fits)**: `p` and `q` counted *every* significant lag of the undifferenced series (the code comment said "take the first significant lag"), so a trend pushed `q` to 8-10, and `P`/`Q` were read from non-seasonal lags of the residuals. Orders are now read on the differenced series, where the ACF/PACF cuts off (capped at 3), with `P`/`Q` set from lag 12. Typical result: SARIMA(1,1,1)(1,0,1,12) instead of SARIMA(1,1,9)(4,0,1,12), which fits in seconds instead of minutes and overfits far less.
 - **SARIMA order selection crash** ("Residuals are all zero and so automatic bandwidth selection cannot be used"): to pick `d`, the series was differenced until the stationarity tests agreed, with no limit. Once over-differenced, KPSS's automatic lag selection estimates a negative long-run variance and `arch` raises an error. KPSS now uses a fixed number of lags (whose estimate can't be negative), `d` is capped at 2, and a test that can't run no longer crashes the app. The Data tab's stationarity verdict uses the same function.
