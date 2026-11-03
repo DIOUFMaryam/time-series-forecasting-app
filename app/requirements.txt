@@ -1,0 +1,36 @@
+# Core app framework
+# The app uses the Shiny for Python 1.x API (ui.sidebar, ui.nav_panel,
+# @render.download, lowercase @reactive.calc / @reactive.effect).
+shiny>=1.0,<2
+shinywidgets>=0.3.4    # 0.2.x predates Shiny 1.0
+nest_asyncio==1.6.0
+typing_extensions>=4.10   # newer htmltools (a shiny dependency) needs TypeIs, added in 4.10.
+                          # This is why tensorflow is 2.14+: 2.13 caps typing_extensions
+                          # below 4.6, and pip refuses to install the two together.
+
+# Data handling
+pandas==2.0.3
+numpy==1.24.3
+openpyxl==3.1.2      # reads .xlsx inputs and writes the forecast.xlsx download
+odfpy==1.4.1          # required for pandas to read the .ods KPI/params file
+
+# Plotting
+matplotlib==3.7.5
+plotly==5.22.0
+
+# Stats / classical forecasting
+statsmodels==0.14.2
+arch==6.3.0            # PhillipsPerron, KPSS, DFGLS stationarity tests
+pymannkendall==1.4.3    # trend test
+
+# ML forecasting models
+prophet==1.1.5
+cmdstanpy==1.1.0       # prophet 1.1.5's bundled Stan folder has no makefile; newer cmdstanpy
+                       # (1.2+/1.3) rejects it -> "'Prophet' object has no attribute 'stan_backend'"
+tensorflow==2.14.1     # CPU is fine; only used for the LSTM model (loaded lazily).
+                       # 2.14 drops 2.13's typing_extensions<4.6 cap, still runs on
+                       # Python 3.9-3.11 with numpy 1.24, and keeps the Keras 2 API.
+scikit-learn==1.3.2
+
+# Misc
+markdown2==2.4.13

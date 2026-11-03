@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Files the app writes when used locally
+forecast.xlsx
+
+# Office lock files (left behind while kpi.ods or an .xlsx is open)
+.~lock.*#
+~$*
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+.spyproject/
+.vscode/
+.idea/
