@@ -51,6 +51,11 @@ customer care calls got flat future forecasts, for three reasons:
   each lag and is wide at lag 12 on a differenced series, so the seasonal
   lag was rarely judged significant. Lag 12 is now compared with the
   white-noise band 1.96 / sqrt(n), the one the Data tab uses.
+- Churn and customer care calls were still flat after these fixes: their
+  seasonality is real but below the seasonal-difference threshold, and the
+  seasonal AR/MA terms fade it out. Without a seasonal difference, the
+  yearly pattern is now added as sine/cosine terms of the month (Fourier
+  terms), their number (0-3) chosen by AICc (sarima_training).
 
 Forecast fixes:
 - the test forecast was shifted by one month (each forecast was compared
@@ -85,6 +90,7 @@ MAX_D = 2           # maximum total differencing d + D
 MAX_PQ = 3          # maximum non-seasonal AR / MA order
 SEASON = 12         # monthly data: yearly seasonality
 SEASONAL_STRENGTH_THRESHOLD = 0.64  # above it: one seasonal difference (D = 1)
+MAX_FOURIER = 3      # maximum sine/cosine pairs for a yearly pattern when D = 0
 
 
 def pacf_plot(timeseries):
@@ -285,26 +291,66 @@ def trend_term(d, D):
     return "c" if d + D <= 1 else "n"
 
 
-def model_label(p, d, q, P, D, Q):
+def fourier_terms(dates, K, season=SEASON):
+    """Yearly seasonal pattern as K pairs of sine/cosine waves of the month
+    of the year (1 to K cycles per year). Tied to the calendar, so the
+    same columns can be computed for any future month."""
+    month = pd.DatetimeIndex(dates).month.values - 1
+    columns = {}
+    for k in range(1, K + 1):
+        angle = 2 * np.pi * k * month / season
+        columns[f"sin{k}"] = np.sin(angle)
+        columns[f"cos{k}"] = np.cos(angle)
+    return pd.DataFrame(columns, index=pd.DatetimeIndex(dates))
+
+
+def fourier_k(fitted_model):
+    """Number of sine/cosine pairs a fitted model uses (0 = none)."""
+    exog = fitted_model.model.exog
+    return 0 if exog is None else exog.shape[1] // 2
+
+
+def model_label(p, d, q, P, D, Q, K=0):
     extra = {0: " with mean", 1: " with drift"}.get(d + D, "")
+    if K:
+        extra += f" + {K} yearly wave(s)"
     return f"SARIMA(({p}, {d}, {q}),({P}, {D}, {Q})){extra}"
 
 
-def sarima_training(timeseries, p, d, q, P, D, Q):
-    order = (p, d, q)
-    s = 12
-    seasonal_order = (P, D, Q, s)
-    model = SARIMAX(timeseries, order=order, seasonal_order=seasonal_order,
+def _fit(timeseries, p, d, q, P, D, Q, K):
+    exog = fourier_terms(timeseries.index, K) if K else None
+    model = SARIMAX(timeseries, exog=exog, order=(p, d, q), seasonal_order=(P, D, Q, SEASON),
                     trend=trend_term(d, D))
-    fitted_model = model.fit(disp=False)
-    return fitted_model
+    return model.fit(disp=False)
+
+
+def sarima_training(timeseries, p, d, q, P, D, Q, K=None):
+    """Fit SARIMA. Without a seasonal difference (D = 0), a stable yearly
+    pattern (a January peak every year...) is added as K sine/cosine pairs,
+    K from 0 to MAX_FOURIER chosen by AICc (dynamic harmonic regression,
+    Hyndman & Athanasopoulos). The seasonal AR/MA terms alone tend to fade
+    the pattern out over the forecast, which gave flat forecasts for churn
+    and customer care calls. With D = 1 the seasonal difference already
+    repeats last year's pattern, so K = 0. Pass K to force a value."""
+    if K is None:
+        if D > 0 or len(timeseries) < 3 * SEASON:
+            K = 0
+        else:
+            fits = [_fit(timeseries, p, d, q, P, D, Q, k) for k in range(MAX_FOURIER + 1)]
+            return min(fits, key=lambda f: f.aicc)
+    return _fit(timeseries, p, d, q, P, D, Q, K)
+
+
+def _future_exog(fitted_model, dates):
+    K = fourier_k(fitted_model)
+    return fourier_terms(dates, K) if K else None
 
 
 def sarima_forecasting(test, fitted_model):
     # Forecast exactly the test period: step 1 is the first test month.
     # (It used to forecast len(test)+1 steps and drop the first one, so each
     # forecast was compared with the previous month's actual value.)
-    forecast = fitted_model.get_forecast(steps=len(test))
+    forecast = fitted_model.get_forecast(steps=len(test), exog=_future_exog(fitted_model, test.index))
     return pd.Series(np.asarray(forecast.predicted_mean), index=test.index)
 
 
@@ -322,8 +368,9 @@ def future_forecast(timeseries, p, d, q, P, D, Q, horizon):
     if horizon is None or horizon < 1:
         return pd.Series(dtype=float)
     full_model = sarima_training(ts, p, d, q, P, D, Q)
-    values = np.asarray(full_model.forecast(horizon))
-    return pd.Series(values, index=next_months(ts.index[-1], horizon))
+    dates = next_months(ts.index[-1], horizon)
+    values = np.asarray(full_model.forecast(horizon, exog=_future_exog(full_model, dates)))
+    return pd.Series(values, index=dates)
 
 
 def sarima_predictions(fitted_model, timeseries, train, forecast, horizon, p, d, q, P, D, Q):
@@ -340,7 +387,7 @@ def sarima_predictions(fitted_model, timeseries, train, forecast, horizon, p, d,
     if not future.empty:
         fig.add_trace(go.Scatter(x=future.index, y=future.values, mode='lines', name="Future predictions"))
     fig.update_layout(yaxis_title=f"{train.name}", xaxis_title="Date", template='plotly_white')
-    fig.update_layout(title_text=f"{model_label(p, d, q, P, D, Q)} plot of {train.name}")
+    fig.update_layout(title_text=f"{model_label(p, d, q, P, D, Q, fourier_k(fitted_model))} plot of {train.name}")
     return fig
 
 
