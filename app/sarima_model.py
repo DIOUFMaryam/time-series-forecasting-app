@@ -27,14 +27,30 @@ Order selection fix (SARIMA was very slow):
 - p and q counted EVERY significant lag of the undifferenced series, while
   the comment said "take the first significant lag". On a trending series
   almost every lag is significant, so q reached 8-10. They are now read
-  on the series differenced d times, as the number of consecutive
-  significant lags from lag 1 (where the PACF / ACF cuts off), capped at 3.
-- P and Q were read from lags 1-15 of the decomposition residuals, not at
-  the seasonal lag. They are now 1 if the PACF / ACF of the differenced
-  series is significant at lag 12, else 0. D (from the residuals) is
-  capped at 1.
+  on the differenced series, as the number of consecutive significant
+  lags from lag 1 (where the PACF / ACF cuts off), capped at 3.
 - Typical result: SARIMA(1,1,1)(1,0,1,12) instead of SARIMA(1,1,9)(4,0,1,12),
   which fits in seconds instead of minutes and overfits far less.
+
+Flat forecast fix (Nov 2026). Data traffic, ARPU, mobile money, churn and
+customer care calls got flat future forecasts, for three reasons:
+- No constant: SARIMAX has no intercept unless asked. With d = 1 that
+  means no drift, so a trending KPI is forecast flat; with d = 0 the AR
+  terms must mimic the mean and end up close to a random walk. A constant
+  is now included when d + D <= 1 (a mean when d + D = 0, a drift when
+  d + D = 1), the same rule as R's auto.arima. With two differences a
+  constant would be a quadratic trend, so none.
+- D was always 0: it was decided by testing the decomposition RESIDUALS
+  for stationarity, but the residuals are what is left once seasonality
+  is removed, so they never call for a seasonal difference. D is now 1
+  when the series' seasonal strength is above 0.64 (Hyndman &
+  Athanasopoulos' rule), measured on the log scale for positive KPIs
+  (growing seasonal swings) and with an outlier-resistant spread (outage
+  spikes), and the regular difference d is chosen after it.
+- P and Q were read against Bartlett's confidence band, which widens with
+  each lag and is wide at lag 12 on a differenced series, so the seasonal
+  lag was rarely judged significant. Lag 12 is now compared with the
+  white-noise band 1.96 / sqrt(n), the one the Data tab uses.
 
 Forecast fixes:
 - the test forecast was shifted by one month (each forecast was compared
@@ -42,7 +58,7 @@ Forecast fixes:
 - future forecasts came from the model fitted on the first 80% only, so
   they ignored the most recent 20% of the data; the model is now refitted
   on the whole series first (future_forecast)
-- baselines (seasonal_naive_accuracy, persistence_accuracy) to put the
+- baselines (seasonal_naive_mape, persistence_accuracy) to put the
   accuracy figures in context
 """
 import pandas as pd
@@ -65,9 +81,10 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 #import itertools
 
 
-MAX_D = 2           # maximum order of differencing tried by differencing()
+MAX_D = 2           # maximum total differencing d + D
 MAX_PQ = 3          # maximum non-seasonal AR / MA order
 SEASON = 12         # monthly data: yearly seasonality
+SEASONAL_STRENGTH_THRESHOLD = 0.64  # above it: one seasonal difference (D = 1)
 
 
 def pacf_plot(timeseries):
@@ -166,35 +183,43 @@ def differencing(timeseries, max_d=MAX_D):
     return d
 
 
-#def pdq(modelchoice, timeseries):
-#
-#    # Define the p, d, q ranges
-#    p = range(0, 5)
-#    d = range(0, 2)
-#    q = range(0, 5)
-#    # Generate all combinations of p, d, q
-#    pdq = list(itertools.product(p, d, q))
-#    # Find the best parameters
-#    best_aic = np.inf
-#    best_pdq = None
-#
-#    for param in pdq:
-#        try:
-#            model = ARIMA(timeseries, order=param)
-#            results = model.fit()
-#            #print(results.aic)
-#            if results.aic < best_aic:
-#                best_aic = results.aic
-#                best_pdq = param
-#        except:
-#            continue
-#    newp,newd,newq = best_pdq
-#    if modelchoice == "arma":
-#        newd = 0
-#    if modelchoice == "arima":
-#        if newd == 0:
-#            newd = 1
-#    return (newp,newd,newq)
+def _robust_variance(values):
+    # Variance estimated from the median absolute deviation: a few outage
+    # spikes don't inflate it the way they inflate the usual variance
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+    mad = np.median(np.abs(values - np.median(values)))
+    return (1.4826 * mad) ** 2
+
+
+def seasonal_strength(timeseries, season=SEASON):
+    """Share of the detrended variation explained by the seasonal pattern,
+    0 (none) to 1 (pure seasonality): 1 - Var(residual) / Var(seasonal +
+    residual), after Hyndman & Athanasopoulos, Forecasting: Principles and
+    Practice. Measured on the log scale when the KPI is positive (seasonal
+    swings that grow with the level become constant), with an outlier-
+    resistant residual spread."""
+    ts = timeseries.dropna().astype(float)
+    if len(ts) < 2 * season:
+        return 0.0
+    if (ts > 0).all():
+        ts = np.log(ts)
+    decomposition = seasonal_decompose(ts, model='additive', period=season)
+    residual = decomposition.resid
+    mask = residual.notna()
+    total = np.var((decomposition.seasonal + residual)[mask])
+    if total == 0:
+        return 0.0
+    return float(max(0.0, 1 - _robust_variance(residual[mask]) / total))
+
+
+def seasonal_differencing(timeseries, season=SEASON):
+    """D = 1 when the seasonality is strong and there are at least three
+    years to learn it from, else 0."""
+    ts = timeseries.dropna()
+    if len(ts) < 3 * season:
+        return 0
+    return int(seasonal_strength(ts, season) > SEASONAL_STRENGTH_THRESHOLD)
 
 
 def _significant(values, confint):
@@ -215,51 +240,62 @@ def _cutoff(significant, max_order):
     return order
 
 
-def _difference(timeseries, d):
+def _difference(timeseries, d, D=0, season=SEASON):
+    # Seasonal difference(s) first, then regular ones
     ts = timeseries.dropna()
+    for _ in range(D):
+        ts = ts.diff(season).dropna()
     for _ in range(d):
         ts = ts.diff().dropna()
     return ts
 
 
-def select_pdq(timeseries):
-    # d first, then p and q on the series made stationary by differencing:
-    # on the raw series a trend makes nearly every lag look significant
-    d = differencing(timeseries)
-    stationary = _difference(timeseries, d)
-    (acf_values, acf_confint, pacf_values, pacf_confint) = acf_pacf_values(stationary)
+def select_orders(train, residual=None):
+    """Automatic SARIMA orders (p, d, q, P, D, Q) for a training series.
+
+    1. D from the strength of the seasonality (seasonal_differencing)
+    2. d from the stationarity tests, on the seasonally differenced series,
+       so that d + D <= MAX_D
+    3. p and q where the PACF / ACF of the differenced series cuts off
+    4. P and Q: is lag 12 of that PACF / ACF outside the white-noise band?
+
+    `residual` (decomposition residuals) is no longer used; the argument is
+    kept so existing callers still work."""
+    D = seasonal_differencing(train)
+    d = differencing(_difference(train, 0, D), max_d=MAX_D - D)
+    stationary = _difference(train, d, D)
+
+    (acf_values, acf_confint, pacf_values, pacf_confint) = acf_pacf_values(stationary, max_lags=SEASON)
     p = _cutoff(_significant(pacf_values, pacf_confint), MAX_PQ)
     q = _cutoff(_significant(acf_values, acf_confint), MAX_PQ)
-    return (p, d, q)
 
-
-def select_seasonal_pdq(timeseries, residual, d):
-    # D: same stationarity check as before, on the decomposition residuals,
-    # but at most one seasonal difference
-    D = min(differencing(residual), 1)
-    # P and Q: is the seasonal lag (12) significant on the differenced series?
-    stationary = _difference(timeseries, d)
-    (acf_values, acf_confint, pacf_values, pacf_confint) = acf_pacf_values(stationary, max_lags=SEASON)
     if len(acf_values) <= SEASON:
-        return (0, D, 0)  # too short to see a full season
-    P = int(_significant(pacf_values, pacf_confint)[SEASON])
-    Q = int(_significant(acf_values, acf_confint)[SEASON])
-    return (P, D, Q)
-
-
-def select_orders(train, residual):
-    """Automatic SARIMA orders (p, d, q, P, D, Q) for a training series and
-    the residuals of its seasonal decomposition."""
-    (p, d, q) = select_pdq(train)
-    (P, D, Q) = select_seasonal_pdq(train, residual, d)
+        return (p, d, q, 0, D, 0)  # too short to see a full season
+    band = 1.96 / np.sqrt(len(stationary))
+    P = int(abs(pacf_values[SEASON]) > band)
+    Q = int(abs(acf_values[SEASON]) > band)
     return (p, d, q, P, D, Q)
+
+
+def trend_term(d, D):
+    """Constant of the model: a mean when nothing is differenced, a drift
+    (a steady change per month, or per year after a seasonal difference)
+    when the series is differenced once, none beyond (it would become a
+    quadratic trend). Same rule as R's auto.arima."""
+    return "c" if d + D <= 1 else "n"
+
+
+def model_label(p, d, q, P, D, Q):
+    extra = {0: " with mean", 1: " with drift"}.get(d + D, "")
+    return f"SARIMA(({p}, {d}, {q}),({P}, {D}, {Q})){extra}"
 
 
 def sarima_training(timeseries, p, d, q, P, D, Q):
     order = (p, d, q)
     s = 12
     seasonal_order = (P, D, Q, s)
-    model = SARIMAX(timeseries, order=order, seasonal_order=seasonal_order)
+    model = SARIMAX(timeseries, order=order, seasonal_order=seasonal_order,
+                    trend=trend_term(d, D))
     fitted_model = model.fit(disp=False)
     return fitted_model
 
@@ -304,26 +340,30 @@ def sarima_predictions(fitted_model, timeseries, train, forecast, horizon, p, d,
     if not future.empty:
         fig.add_trace(go.Scatter(x=future.index, y=future.values, mode='lines', name="Future predictions"))
     fig.update_layout(yaxis_title=f"{train.name}", xaxis_title="Date", template='plotly_white')
-    fig.update_layout(title_text=f"SARIMA (({p}, {d}, {q}),({P}, {D}, {Q})) plot of {train.name}")
+    fig.update_layout(title_text=f"{model_label(p, d, q, P, D, Q)} plot of {train.name}")
     return fig
 
 
-def seasonal_naive_accuracy(timeseries, train_share=0.80, season=SEASON):
-    """Accuracy (100 - MAPE) of the "same month last year" forecast on the
-    same test split as SARIMA: a reference that needs no model at all."""
+def seasonal_naive_mape(timeseries, train_share=0.80, season=SEASON):
+    """Average % error of the "same month last year" forecast on the same
+    test split as SARIMA and the LSTM: a reference that needs no model."""
     ts = np.asarray(timeseries.dropna(), dtype=float)
     n = int(len(ts) * train_share)
     if n < season or n >= len(ts):
         return np.nan
     test = ts[n:]
     naive = np.array([ts[n - season + (i % season)] for i in range(len(test))])
-    return 100 - accuracy_metrics(naive, test)[2]
+    return accuracy_metrics(naive, test)[2]
+
+
+def seasonal_naive_accuracy(timeseries, train_share=0.80, season=SEASON):
+    """100 - seasonal_naive_mape (kept for older callers)."""
+    return 100 - seasonal_naive_mape(timeseries, train_share, season)
 
 
 def persistence_accuracy(timeseries, train_share=0.80):
     """Accuracy of "next month = this month's actual value", one month
-    ahead over the test split: the reference for a one-step-ahead test such
-    as the LSTM's."""
+    ahead over the test split."""
     ts = np.asarray(timeseries.dropna(), dtype=float)
     n = int(len(ts) * train_share)
     if n < 1 or n >= len(ts):

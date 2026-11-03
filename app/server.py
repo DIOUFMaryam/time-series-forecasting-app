@@ -37,6 +37,12 @@ LSTM rework (see lstm_model.py): it now models month-to-month differences,
 is tested over the whole test period like SARIMA (same split, same
 "same month last year" baseline), and is back in the "most accurate"
 pick. All LSTM code paths go through lstm_model.evaluate_and_forecast.
+
+Plainer performance messages: "Model is 95% accurate" (100 - MAPE) is
+replaced by the average % error next to the error of the "same month last
+year" reference, with a verdict ("x% smaller error than the reference");
+"Model is valid" becomes "Residual checks passed / failed", in plain words.
+The Forecast tab compares average errors (lower is better).
 """
 
 from shiny import reactive, render, ui
@@ -948,97 +954,95 @@ def create_server():
             return ui.HTML(style_table(df))
 
 
-        # Model precision, homoscedasticity and autocorrelation
+        # Model error next to the error of a forecast that needs no model
+        # ("same month last year"), plus residual checks for SARIMA.
+        # It used to say "Model is 95% accurate" (100 - MAPE): on slowly
+        # changing KPIs even a forecast with no model gets 95%, so that
+        # figure meant little on its own.
+        GREEN = "background-color: #DDFFDD; color: #006400;"
+        ORANGE = "background-color: #FFF9E6; color: #FF8C00;"
+        RED = "background-color: #FFDDDD; color: #B22222;"
+        GREY = "text-align: center; color: #696969;"
+
+        def _compare_with_reference(mape, ref):
+            """(style, verdict) comparing the model's average % error with
+            the reference's. A model is called better or worse when its
+            error is at least 10% smaller or larger than the reference's."""
+            change = (ref - mape) / ref * 100
+            if change >= 10:
+                return GREEN, f"{change:.0f}% smaller error than the reference: the model adds value."
+            if change > -10:
+                return ORANGE, "About the same error as the reference: the model adds little."
+            return RED, (f"{-change:.0f}% larger error than the reference: "
+                         "try other parameters or another model.")
+
+
         @reactive.calc
         def isModelValid():
             df = accuracy()
             if df is None or df.empty:
-                return (None,) * 6
+                return (None,) * 4
 
-            error_percentage = df["Mean Absolute Percentage Error (%)"].values[-1]
-            acc = round(100 - error_percentage, 2)
-            if error_percentage < 5.0:
-                error_message = ui.HTML(f'<div style="background-color: #DDFFDD; color: #006400;">Model is {acc}% accurate</div>')
-            elif error_percentage < 20.0:
-                error_message = ui.HTML(f'<div style="background-color: #FFF9E6; color: #FF8C00;">Model is {acc}% accurate</div>')
-            else:
-                error_message = ui.HTML(f'<div style="background-color: #FFDDDD; color: #B22222;">Model is {acc}% accurate</div>')
-            homoscedasticity = ui.HTML("")
-            autocorrelation = ui.HTML("")
-            hm, ac = "", ""
+            mape = df["Mean Absolute Percentage Error (%)"].values[-1]
+            ref = sarima_model.seasonal_naive_mape(selected_data())
+            residual_lines, residuals_ok = [], None
 
             if input.model_choice() == "sarima":
                 sarima_fitted_model, _, _, _ = sarima()
                 residuals = sarima_fitted_model.resid
                 bp_test = sms.het_breuschpagan(residuals, sm.add_constant(np.arange(len(residuals))))
                 ljung_box_test = acorr_ljungbox(residuals, lags=[15], return_df=True)
-                lm_pvalue = bp_test[1]
-                f_pvalue = bp_test[3]
-                lb_pvalue = ljung_box_test.lb_pvalue[15]
-                if lm_pvalue > 0.05 and f_pvalue > 0.05:
-                    homoscedasticity = ui.HTML('<div style="background-color: #DDFFDD; color: #006400;">Homoscedasticity is checked</div>')
-                    hm = "Yes"
-                else:
-                    homoscedasticity = ui.HTML('<div style="background-color: #FFDDDD; color: #B22222;">Homoscedasticity is not checked</div>')
-                    hm = "No"
-                if lb_pvalue > 0.05:
-                    autocorrelation = ui.HTML('<div style="background-color: #DDFFDD; color: #006400;">There is no autocorrelation between residuals</div>')
-                    ac = "No"
-                else:
-                    autocorrelation = ui.HTML('<div style="background-color: #FFDDDD; color: #B22222;">There is autocorrelation between residuals</div>')
-                    ac = "Yes"
+                constant_variance = bp_test[1] > 0.05 and bp_test[3] > 0.05
+                no_pattern = ljung_box_test.lb_pvalue[15] > 0.05
+                residual_lines = [
+                    ui.HTML(f'<div style="{GREEN}">Errors have a constant spread over time</div>'
+                            if constant_variance else
+                            f'<div style="{RED}">Errors spread more at some times than others</div>'),
+                    ui.HTML(f'<div style="{GREEN}">No pattern left in the errors</div>'
+                            if no_pattern else
+                            f'<div style="{RED}">A pattern is left in the errors (autocorrelation)</div>'),
+                ]
+                residuals_ok = constant_variance and no_pattern
 
-            return (acc, hm, ac, error_message, homoscedasticity, autocorrelation)
+            return (mape, ref, residual_lines, residuals_ok)
 
 
         @render.ui
         def modelValidity():
-            (acc, hm, ac, error_message, homoscedasticity, autocorrelation) = isModelValid()
-            if acc is None:
+            (mape, ref, residual_lines, residuals_ok) = isModelValid()
+            if mape is None:
                 return None
-            return ui.TagList(error_message, homoscedasticity, autocorrelation)
-
-
-        # Compare the model's accuracy with a forecast that needs no model.
-        # On slowly changing KPIs, 100 - MAPE is high even for a naive
-        # forecast, so "95% accurate" only means something next to this.
-        # SARIMA and LSTM are tested on exactly the same months as this
-        # reference; Prophet by cross-validation (approximate comparison).
-        def _baseline_note(acc):
-            ts = selected_data()
-            model = input.model_choice()
-            base = sarima_model.seasonal_naive_accuracy(ts)
-            label = "Repeating the same month of last year scores {:.1f}% on the last 20% of the data"
-            label += (" (Prophet is tested by cross-validation, so this comparison is approximate)."
-                      if model == "prophet" else ", the same test months.")
-            if pd.isna(base):
-                return None
-            gain = acc - base
-            if gain >= 2:
-                verdict = f"The model does better than this reference, by {gain:.1f} points."
-            elif gain > -2:
-                verdict = "The model does about as well as this reference, so it adds little."
+            text = f"Average error on the test months: {mape:.1f}%"
+            if pd.isna(ref):
+                style = GREY
             else:
-                verdict = f"The model does worse than this reference, by {-gain:.1f} points: try other parameters or another model."
-            return ui.HTML(f'<div style="text-align: center; color: #696969;">Reference: {label.format(base)} {verdict}</div>')
+                text += f" (reference: {ref:.1f}%)"
+                style = _compare_with_reference(mape, ref)[0]
+            return ui.TagList(ui.HTML(f'<div style="{style}">{text}</div>'), *residual_lines)
 
 
         @render.ui
         def validityMessage():
-            (acc, hm, ac, error_message, homoscedasticity, autocorrelation) = isModelValid()
-            if acc is None:
+            (mape, ref, residual_lines, residuals_ok) = isModelValid()
+            if mape is None:
                 return None
 
-            note = _baseline_note(acc)
-            if input.model_choice() == "sarima":
-                if hm == "Yes" and ac == "No":
-                    valid = ui.HTML('<div style="text-align: center; color: #696969;">Model is valid</div>')
-                    return ui.TagList(valid, note)
-                invalid = ui.HTML('<div style="text-align: center; color: #696969;">Model is not valid</div>')
-                advice = ui.HTML('<div style="text-align: center; color: #696969;">Change parameters until homoscedasticity is achieved or residuals are no longer autocorrelated. Or consider changing model altogether.</div>')
-                return ui.TagList(invalid, advice, note)
-            # No residual tests are run for Prophet and LSTM, so no validity claim
-            return ui.TagList(note)
+            messages = []
+            if not pd.isna(ref):
+                messages.append(_compare_with_reference(mape, ref)[1])
+                if input.model_choice() == "prophet":
+                    messages.append("Reference: repeating the same month of last year, a forecast with "
+                                    "no model. Prophet is tested by cross-validation, on other months, "
+                                    "so this comparison is approximate.")
+                else:
+                    messages.append("Reference: repeating the same month of last year, a forecast with "
+                                    "no model, on the same test months (the last 20% of the data).")
+            if residuals_ok is True:
+                messages.append("Residual checks passed: the errors look like random noise.")
+            elif residuals_ok is False:
+                messages.append("Residual checks failed: the model misses part of the pattern. "
+                                "Try other parameters or another model.")
+            return ui.TagList(*[ui.HTML(f'<div style="{GREY}">{m}</div>') for m in messages])
 
 
         # Information icon next to the selected KPI
@@ -1156,25 +1160,24 @@ def create_server():
             return ui.HTML(html)
 
 
-        # Accuracy of all models for the selected data
+        # Average % error of all models for the selected data, lower is better
         @render.ui
         def models_accuracy():
             if selected_data() is None:
                 return None
             def _display(mape):
-                return "unavailable" if pd.isna(mape) else 100 - mape
-            baseline = sarima_model.seasonal_naive_accuracy(selected_data())
-            acc = {"Accuracy": "%",
-                   "SARIMA": _display(_mape(sarima_accuracy())),
-                   "Prophet": _display(_mape(prophet_accuracy())),
-                   "LSTM": _display(_lstm_mape()),
-                   "Same month last year": "unavailable" if pd.isna(baseline) else baseline}
-            note = ui.div("Each model is tested on recent data it hasn't seen (SARIMA, LSTM and the "
-                          "reference on the last 20% of the data, Prophet by cross-validation). "
-                          "\"Same month last year\" is a forecast with no model at all: a model is "
-                          "only useful if it clearly beats it.",
+                return "unavailable" if pd.isna(mape) else mape
+            errors = {"": "Average error (%)",
+                      "SARIMA": _display(_mape(sarima_accuracy())),
+                      "Prophet": _display(_mape(prophet_accuracy())),
+                      "LSTM": _display(_lstm_mape()),
+                      "Same month last year": _display(sarima_model.seasonal_naive_mape(selected_data()))}
+            note = ui.div("Average error of each model on recent data it hasn't seen (SARIMA, LSTM and "
+                          "the reference on the last 20% of the data, Prophet by cross-validation). "
+                          "Lower is better. \"Same month last year\" is a forecast with no model at all: "
+                          "a model is only useful if its error is clearly smaller.",
                           style="color: #696969; font-size: 0.85rem;")
-            return ui.TagList(ui.HTML(style_table(pd.DataFrame(acc, index=[0]))), note)
+            return ui.TagList(ui.HTML(style_table(pd.DataFrame(errors, index=[0]))), note)
 
 
         # Plot of all models' predictions
@@ -1452,7 +1455,7 @@ def create_server():
                           ui.row(ui.column(6, ui.output_ui("accuracyMetrics"))),
                           ui.br(),
                           ui.row(
-                              ui.h6("Model validity"),
+                              ui.h6("How good is the model?"),
                               ui.row(
                                   ui.column(6, ui.output_ui("modelValidity")),
                                   ui.column(6, ui.output_ui("validityMessage"))
