@@ -26,6 +26,9 @@ Deployment:
 
 Stationarity verdict (Data tab) now uses sarima_model.stationarity_test,
 the same fixed-lag rule as the SARIMA differencing step.
+
+Batch forecast / download: a model failing for one KPI no longer empties
+the whole file, and the Excel file is built before it is sent.
 """
 
 from shiny import reactive, render, ui
@@ -60,7 +63,7 @@ import markdown2  # For converting markdown to HTML
 
 from pymannkendall import original_test as mk_test
 
-from io import BytesIO
+import tempfile
 
 
 KPI_FILE = os.path.join(ROOT_DIR, "kpi.ods")
@@ -1220,83 +1223,114 @@ def create_server():
             return ui.div(*ui_elements)
 
 
-        # Train and predict for the selected KPIs
+        # Forecast `horizon` months of one KPI with one model
+        def _forecast_kpi(kpi, selected_model, timeseries, horizon):
+            train_size = int(len(timeseries) * 0.80)
+
+            if selected_model == "SARIMA":
+                train, test = timeseries[:train_size], timeseries[train_size:]
+                (trend, seasonal, residual) = sarima_model.series_decompose(train)
+                p, d, q, P, D, Q = _sarima_orders(kpi, train, residual)
+
+                sarima_fitted_model = sarima_model.sarima_training(train, p, d, q, P, D, Q)
+                sarima_previsions = sarima_fitted_model.predict(start=0, end=len(timeseries)+horizon)
+                return sarima_previsions[-horizon:].values
+
+            if selected_model == "Prophet":
+                prophet_fitted_model, scaler = prophet_model.prophet_training(timeseries)
+                prophet_previsions = prophet_model.prophet_forecasting(prophet_fitted_model, horizon, scaler)
+                return prophet_previsions['yhat'][-horizon:].values
+
+            if selected_model == "LSTM":
+                values = timeseries.values.reshape(-1, 1).astype('float32')
+
+                # Defaults, overridden by saved ones for this KPI
+                s = _lstm_settings(kpi, use_saved=True)
+                look_back = s["look_back"]
+
+                # Split raw values first, fit the scaler on train only
+                raw_train = values[0:train_size, :]
+                raw_test = values[train_size-look_back-1:len(values), :]
+                scaler, train = lstm_model.scaling(raw_train)
+                test = lstm_model.scale_transform(scaler, raw_test)
+
+                trainX, trainY, testX, testY = lstm_model.reshaping(train, test, look_back)
+
+                model = lstm_model.lstm_model(look_back, s["nb_layers"], s["nb_units"], s["optimizer"])
+                lstm_model.lstm_training(model, trainX, trainY, s["epoch"], s["batchsize"], s["Verbose"], s["Validationsplit"])
+
+                last_sequence = testX[-1]
+                future_predictions = lstm_model.lstm_future_predictions(model, last_sequence, look_back, horizon + 1, scaler)
+                return future_predictions[:, 0][-horizon:]
+
+            raise ValueError(f"unknown model {selected_model!r}")
+
+
+        # Train and predict for the selected KPIs.
+        # Returns (predictions, failures): a KPI whose model fails (e.g. LSTM
+        # when TensorFlow can't load) gets an empty column and a message in
+        # `failures`, instead of making the whole forecast and download fail.
         @reactive.calc
         def generate_predictions():
             df = data()
             if df is None:
-                return pd.DataFrame()
+                return pd.DataFrame(), {}
 
             selected_kpis = input.selected_kpis()
-            predictions = pd.DataFrame()
             horizon = input.predictionHorizon()
-            if horizon is None or horizon == "":
-                horizon = 0
+            if horizon is None or horizon == "" or horizon < 1:
+                horizon = 12
+            horizon = int(horizon)
 
+            predictions = pd.DataFrame()
+            failures = {}
             for kpi in selected_kpis:
                 selected_model = input[f"model_{_kpi_id(kpi)}"]()
                 timeseries = df[kpi].dropna()
-                train_size = int(len(timeseries) * 0.80)
-                time_indices = timeseries.index
-                future_time_indices = lstm_model.future_timeindices(time_indices, horizon+1)
+                future_time_indices = lstm_model.future_timeindices(timeseries.index, horizon+1)
                 predictions["Date"] = future_time_indices[-horizon:]
+                try:
+                    predictions[kpi] = _forecast_kpi(kpi, selected_model, timeseries, horizon)
+                except Exception as e:
+                    predictions[kpi] = np.nan
+                    failures[kpi] = f"{selected_model} failed for {kpi}: {e}"
+            return predictions, failures
 
-                if selected_model == "SARIMA":
-                    train, test = timeseries[:train_size], timeseries[train_size:]
-                    (trend, seasonal, residual) = sarima_model.series_decompose(train)
-                    p, d, q, P, D, Q = _sarima_orders(kpi, train, residual)
 
-                    sarima_fitted_model = sarima_model.sarima_training(train, p, d, q, P, D, Q)
-                    sarima_previsions = sarima_fitted_model.predict(start=0, end=len(timeseries)+horizon)
-                    predictions[kpi] = sarima_previsions[-horizon:].values
-
-                if selected_model == "Prophet":
-                    prophet_fitted_model, scaler = prophet_model.prophet_training(timeseries)
-                    prophet_previsions = prophet_model.prophet_forecasting(prophet_fitted_model, horizon, scaler)
-                    predictions[kpi] = prophet_previsions['yhat'][-horizon:].values
-
-                if selected_model == "LSTM":
-                    values = timeseries.values.reshape(-1, 1).astype('float32')
-
-                    # Defaults, overridden by saved ones for this KPI
-                    s = _lstm_settings(kpi, use_saved=True)
-                    look_back = s["look_back"]
-
-                    # Split raw values first, fit the scaler on train only
-                    raw_train = values[0:train_size, :]
-                    raw_test = values[train_size-look_back-1:len(values), :]
-                    scaler, train = lstm_model.scaling(raw_train)
-                    test = lstm_model.scale_transform(scaler, raw_test)
-
-                    trainX, trainY, testX, testY = lstm_model.reshaping(train, test, look_back)
-
-                    model = lstm_model.lstm_model(look_back, s["nb_layers"], s["nb_units"], s["optimizer"])
-                    lstm_model.lstm_training(model, trainX, trainY, s["epoch"], s["batchsize"], s["Verbose"], s["Validationsplit"])
-
-                    last_sequence = testX[-1]
-                    future_predictions = lstm_model.lstm_future_predictions(model, last_sequence, look_back, horizon + 1, scaler)
-                    predictions[kpi] = future_predictions[:, 0][-horizon:]
-
-            return predictions
+        def _show_failures(failures):
+            for message in failures.values():
+                ui.notification_show(message, type="warning", duration=10)
 
 
         # Download predictions as an Excel file
         # (render.download: the function name is the output id used by
-        # ui.download_button("download_predictions", ...))
+        # ui.download_button("download_predictions", ...)).
+        # The file is built when the button is clicked and its path is
+        # returned. It used to be built inside a generator, which only runs
+        # while the file is being sent: an error at that point (a model
+        # failing) cut the transfer and left an empty file, with no message.
         @render.download(filename="forecast.xlsx")
         def download_predictions():
-            predictions_df = generate_predictions()
-            buffer = BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            if not input.selected_kpis():
+                ui.notification_show("Choose at least one KPI before downloading the forecast.",
+                                     type="warning", duration=8)
+            predictions_df, failures = generate_predictions()
+            _show_failures(failures)
+            path = os.path.join(tempfile.mkdtemp(), "forecast.xlsx")
+            with pd.ExcelWriter(path, engine='openpyxl') as writer:
                 predictions_df.to_excel(writer, index=False)
-            yield buffer.getvalue()
+            return path
 
 
         # Predictions table for all selected KPIs
         @render.ui
         @reactive.event(input.forecast)
         def previsions_table():
-            return ui.HTML(style_table(generate_predictions()))
+            predictions_df, failures = generate_predictions()
+            if predictions_df.empty:
+                return ui.div("Choose at least one KPI and its model in the Modeling tab.", style="color: #696969;")
+            notes = [ui.div(m, style="color: #B22222;") for m in failures.values()]
+            return ui.TagList(ui.HTML(style_table(predictions_df)), *notes)
 
 
         # ---- Tab contents -------------------------------------------------
