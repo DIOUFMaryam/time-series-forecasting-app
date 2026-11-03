@@ -40,7 +40,7 @@ for kpi in df.columns:
     rows.append({
         "KPI": kpi,
         "Seasonal strength": round(sm.seasonal_strength(train), 2),
-        "Model": sm.model_label(p, d, q, P, D, Q),
+        "Model": sm.model_label(p, d, q, P, D, Q, sm.fourier_k(fitted)),
         "Test error %": round(test_mape, 2),
         "Reference error %": round(sm.seasonal_naive_mape(ts), 2),
         "Forecast movement": round(movement, 2),
