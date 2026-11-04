@@ -76,12 +76,22 @@ There are five tabs :
 - **LSTM settings**: the LSTM learns the month-to-month changes of the KPI (not its level) from the previous *Sequence length* months, then adds the predicted changes to the last known value. Defaults: 1 layer of 8 units, sequence length 12, adam, batch size 16. *Maximum epochs* is an upper limit: training stops when the error on the validation months (the last *Validation split* share of the training data) has not improved for 20 epochs, and the best weights are kept. The plot title shows how many epochs were used. The future values come from a second model trained on the whole series for that number of epochs. A series with too few months for the chosen sequence length gets a message asking for a shorter one.
 - **Reading the performance**: each model is scored by its average percentage error on the most recent 20% of the data, which it hasn't seen. SARIMA and the LSTM forecast that whole period from its start, without seeing any of its actual values. On slowly changing KPIs this error is small even for a forecast with no model, so the Performance and Forecast tabs show it next to the error of a reference, "same month last year", on the same months, with a verdict: *x% smaller error than the reference* (green, the model adds value), *about the same* (orange, within 10%), or *larger error* (red). A model is only worth using if its error is clearly smaller. Prophet is tested by cross-validation instead, so its comparison with the reference is approximate. For SARIMA, two residual checks are added: the errors should have a constant spread over time (Breusch-Pagan test) and leave no pattern (Ljung-Box test); when both pass, the model has captured the structure it can.
 - **SARIMA settings**: by default the orders are chosen automatically. A seasonal difference is used when the seasonality is strong, then a regular difference if the stationarity tests ask for one; the AR and MA orders are read from the ACF and PACF. When the seasonality is real but not strong enough for a seasonal difference, the yearly pattern is added as up to 3 sine/cosine waves of the month of the year, as many as improve the model's AICc. The plot title shows the model, with "with mean" or "with drift" when it includes a constant (a steady monthly or yearly change) and "+ K yearly wave(s)" when it uses them.
-- **Forecast**: this tab shows the generated predictions of the selected time series by all the models and their accuracy, so as to see the most accurate model. There is also a plot of the predictions to compare and determine the most optimistic (pessimistic) model. Then users can choose which variables (the columns of the loaded file) to generate predictions from and the right model for each and click on the *Download* button to save the predictions in an Excel file or just click on *Show forecast* to visualize them within the app. If the LSTM model is unavailable on the machine (see Troubleshooting), it is shown as "unavailable" and the most accurate model is chosen among SARIMA and Prophet.
+- **Forecast**: the *Modeling* sub-tab compares the three models on the selected KPI. At the top, the average error of each model next to that of the *same month last year* reference (lower is better). Below, a plot of each model's forecast for the next months, next to the forecast values, the most accurate model outlined in green. The last block, *Forecast several KPIs*, is for forecasting more than one KPI at once: choose the KPIs (the columns of the loaded file), pick a model for each, then click *Download Predictions* to save the forecasts in an Excel file, or open the *Forecast* sub-tab and click *Show Forecast* to see them in the app. If the LSTM model is unavailable on the machine (see Troubleshooting), it is shown as "unavailable" and the most accurate model is chosen among SARIMA and Prophet.
 - **Documentation**: provides in-app documentation for user assistance.
 
 ## Advanced Features
-- **Customization**: If applicable, explain how users can customize the app (e.g., changing model parameters, adjusting plots).
-- **Download Options**: Describe how users can download data, forecasts, or other outputs.
+- **Choosing model parameters**: tick *Choose model parameters* in the Model tab, change the values and click *Train*.
+    - *SARIMA*: the orders p, d, q (non-seasonal) and P, D, Q (seasonal, period 12 months). The ACF and PACF plots under the model plot help choose them: p is roughly where the PACF stops being significant, q where the ACF does, P and Q whether lag 12 is significant. A mean, a drift and yearly waves are still added automatically when they fit (see SARIMA settings).
+    - *LSTM*: number of layers and units, optimizer, sequence length, maximum epochs, batch size, verbosity and validation split (see LSTM settings). Bigger networks are rarely better on ten years of monthly data: they learn the noise of the training months.
+- **Saving parameters**: when a set of parameters works well for a KPI, *Save* stores it in `kpi.ods` (one row per KPI, one sheet per model). Tick *Use saved parameters* to reuse them; the Forecast tab's download also uses them. Saving is turned off on the public demo, so every visitor sees the same results.
+- **Prediction time**: the number of months to forecast, set in the Model tab, applies to the model plots, the Forecast tab comparison and the download (12 months when the box is empty).
+- **Using your own data**: drop an `.xlsx` file in the `files` folder: dates in the first column, one row per month, one numeric column per KPI. It appears in the file list on the next start. To show a description when hovering the ⓘ icon, add a row (KPI name, description) to the *Description* sheet of `kpi.ods`. The demo data can be rebuilt at any time with `python scripts/generate_synthetic_kpis.py` (this also resets the saved parameters).
+- **Interactive plots**: all model plots can be zoomed (drag a rectangle; double-click to reset), read point by point (hover), and filtered (click a legend entry to hide or show a line). The camera icon above each plot saves it as a PNG image.
+
+## Download Options
+- **Forecasts as Excel**: in the Forecast tab, choose one or more KPIs under *Choose KPIs*, pick a model for each, then click *Download Predictions*. The file `forecast.xlsx` has a *Date* column (the months after the last observation) and one column per KPI. *Show Forecast* displays the same table in the app.
+- If a model fails for a KPI (for example the LSTM when TensorFlow can't load, or a series too short for the chosen sequence length), that KPI's column is left empty, a warning explains why, and the other KPIs are still forecast.
+- **Plots**: saved one by one with the camera icon (see Interactive plots).
 
 ## Troubleshooting
 - **Common Issues**:
@@ -95,10 +105,73 @@ There are five tabs :
 - **Support**: contact *diouf.maryam5100@gmail.com* for support.
 
 ## Appendices
-- **Technical Details**: (Optional) Include technical details about the models used or the backend implementation.
-- **Glossary**: Define any technical terms used in the app or documentation.
 
-Explain in details: 
-- moving avg and std and their function
-- the stationarity tests (ADF, PP, KPSS)
-- Each model (sarima, prophet and lstm) and the type of data they are meant for, parameters and how to choose them, how to validate the model (metrics, autocorrelation, accuracy).
+### Moving average and moving standard deviation
+The Time Series Plot tab scales the series to between 0 and 1, then draws its average and standard deviation over a sliding 12-month window. A 12-month window averages out the seasonality, so what remains is the trend. If both lines stay roughly flat, the series keeps the same level and the same spread over time, which is what *stationary* means. A rising average shows a trend; a widening standard deviation shows fluctuations that grow over time (as often happens when a KPI grows).
+
+### Stationarity tests
+A series is stationary when its average, spread and correlations don't change over time. Classical models such as SARIMA need a stationary series, so a non-stationary one is first *differenced* (each month minus the previous one, or minus the same month of the previous year). The Data tab runs three tests, each with a different starting assumption:
+
+| Test | Assumes at first | Stationary when |
+|---|---|---|
+| DF-GLS (a more powerful version of the Augmented Dickey-Fuller test) | the series has a unit root (it wanders, not stationary) | p-value < 0.05 |
+| Phillips-Perron (PP) | the series has a unit root | p-value < 0.05 |
+| KPSS | the series is stationary | p-value ≥ 0.05 |
+
+The app calls a series stationary when at least two of the three agree. Using tests with opposite starting assumptions protects against one test's blind spots. The number of lags in the tests follows Schwert's rule, 12 × (n/100)^¼ for n observations.
+
+### Trend and seasonality
+- **Trend**: the Mann-Kendall test checks whether values tend to rise (or fall) over time, without assuming a straight line. The trend is called strong when its p-value is below 0.01 and weak below 0.05.
+- **Seasonality**: detected when the partial autocorrelation (PACF) has more than two significant lags. The series is then split into trend, seasonal pattern and remainder (classical decomposition), and the seasonality is called strong when the seasonal pattern's standard deviation is above a tenth of the remainder's, weak above a twentieth.
+- **Recommended model**:
+    - under 1,000 points: SARIMA when less than 5% of the values are missing and the series doesn't have both a strong trend and a strong seasonality; Prophet otherwise;
+    - 1,000 points or more: Prophet when the series isn't stationary and has a strong trend or seasonality; LSTM otherwise.
+
+    Ten years of monthly data is 120 points, so the LSTM is never recommended on monthly KPIs, though it can still be chosen.
+
+### The models
+**SARIMA** (Seasonal AutoRegressive Integrated Moving Average) forecasts each month from the previous months (AR terms, p), from its previous errors (MA terms, q), and from the same months a year earlier (seasonal terms P and Q), after differencing the series d times (and D times at a 12-month lag) to make it stationary. It suits short, regular monthly series and stays interpretable. The app chooses the orders automatically from the training data:
+1. D = 1 when the seasonality is strong (seasonal strength above 0.64, measured on the log scale for positive KPIs and with an outlier-resistant spread);
+2. d from the stationarity tests on the seasonally differenced series (d + D at most 2);
+3. p and q where the PACF and ACF of the differenced series cut off (at most 3);
+4. P and Q from lag 12 of the PACF and ACF.
+
+A constant is added when d + D ≤ 1: a mean (no differencing) or a drift, i.e. a steady change per month or per year (one difference). Without a seasonal difference, a stable yearly pattern is added as up to 3 sine/cosine waves of the month (Fourier terms), as many as improve the AICc. The model is checked on its residuals (the training errors): Breusch-Pagan tests whether their spread is constant over time, Ljung-Box (15 lags) whether a pattern is left in them. When both pass, the errors look like random noise and the model has captured the structure it can.
+
+**Prophet** (Meta) fits a piecewise-linear trend, whose slope can change at automatically detected dates, plus a yearly seasonal pattern. It copes well with missing months, sudden changes of trend and level shifts (such as the mobile money jump in 2020), and needs no differencing. The app uses Prophet's default settings and does not expose them. It is tested by rolling cross-validation: trained on the first half of the history, it forecasts the next months, then the training window moves forward and it forecasts again; the errors are averaged over these windows.
+
+**LSTM** (Long Short-Term Memory) is a recurrent neural network: it reads the last *sequence length* months and predicts the next one, with a memory that can keep information over many steps. It needs much more data than SARIMA or Prophet to learn reliably and gives no confidence intervals or interpretable coefficients. In this app it learns month-to-month changes rather than levels (so a growing KPI doesn't push it outside the range it was trained on), uses one small layer, and stops training when the error on the most recent training months no longer improves. Multi-month forecasts are recursive: each predicted month becomes an input for the next one.
+
+### How models are validated
+Every model is trained on the first 80% of the series and scored on the last 20%, which it hasn't seen (Prophet: by cross-validation). The metrics:
+
+| Metric | Meaning |
+|---|---|
+| MAE (mean absolute error) | average size of the error, in the KPI's own unit |
+| MSE (mean squared error) | average squared error: large errors weigh much more |
+| RMSE (root mean squared error) | square root of the MSE, back in the KPI's unit |
+| MAPE (mean absolute percentage error) | average error as a % of the actual value, comparable across KPIs (months where the KPI is 0 are left out) |
+
+The MAPE is always shown next to that of the reference forecast, *same month last year*, on the same months. Monthly KPIs change slowly, so even a forecast with no model has a small error; a model is worth using only when its error is clearly smaller than the reference's.
+
+### Glossary
+- **AICc**: corrected Akaike Information Criterion; scores how well a model fits while penalizing extra parameters. Lower is better; only models fitted on the same data can be compared.
+- **ACF / PACF**: autocorrelation function (how much each month resembles the month k months earlier) and partial autocorrelation function (the same, once the months in between are accounted for).
+- **Baseline / reference**: a forecast that needs no model (here, the same month of the previous year), used to judge whether a model adds anything.
+- **Batch size**: number of training sequences the LSTM looks at before each update of its weights.
+- **Differencing**: replacing each value by its change from the previous month (or from the same month a year earlier); removes a trend (or a seasonal pattern).
+- **Drift**: a steady change per period added to a differenced model, so that the forecast continues the trend.
+- **Early stopping**: ending the LSTM's training when its error on validation months stops improving, to avoid learning the noise of the training months.
+- **Epoch**: one pass of the LSTM over all its training sequences.
+- **Fourier terms**: sine and cosine waves of the month of the year; one to three of them can draw most smooth yearly patterns.
+- **Forecast horizon**: number of months forecast after the last observation.
+- **Residuals**: the differences between the actual values and the model's fitted values on the training months.
+- **Seasonality**: a pattern that repeats every year (e.g. a December peak).
+- **Sequence length (look-back)**: number of past months the LSTM reads to predict the next one.
+- **Stationarity**: constant average, spread and correlations over time.
+- **Train / test split**: the data used to fit a model (first 80%) and the data kept aside to score it (last 20%).
+- **Trend**: the long-term direction of a series.
+- **Validation split**: the share of the LSTM's training data (the most recent part) kept aside for early stopping.
+
+### Further reading
+Hyndman, R. J. & Athanasopoulos, G., *Forecasting: Principles and Practice* (3rd ed.), free online at otexts.com/fpp3: stationarity and differencing, ARIMA, seasonal strength, dynamic harmonic regression, forecast evaluation.

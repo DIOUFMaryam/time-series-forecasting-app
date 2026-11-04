@@ -74,7 +74,7 @@ TSF/
 │   └── requirements.txt
 ├── scripts/
 │   ├── generate_synthetic_kpis.py   # builds files/telecom_kpis_synthetic.xlsx and kpi.ods
-│   └── check_sarima.py              # SARIMA on every demo KPI: model, errors, flat or not
+│   └── check_sarima.py              # SARIMA on every demo KPI: model, errors, flat or not, timing
 ├── files/                 # .xlsx files the app lists and lets users pick
 ├── kpi.ods                # KPI descriptions + saved per-KPI model parameters
 ├── Documentation.md       # user guide, also shown in the app's Documentation tab
@@ -153,6 +153,12 @@ SARIMA forecasts flat on five of the eight KPIs:
 - **The seasonal difference was never used**: `D` was chosen by testing the *residuals of the seasonal decomposition* for stationarity, but the residuals are what is left once seasonality is removed, so `D` was always 0. It is now 1 when the seasonal strength is above 0.64 (Hyndman & Athanasopoulos' rule), measured on the log scale (seasonal swings that grow with the level) with a spike-resistant spread (outages).
 - **The seasonal lag was rarely judged significant**: `P`/`Q` were read against Bartlett's confidence band, which widens with every lag. Lag 12 is now compared with the white-noise band `1.96/√n`.
 - **Stable seasonal patterns faded out**: churn and customer care calls have a real yearly pattern (January peak) but below the seasonal-difference threshold, and seasonal AR/MA terms shrink it a little more each forecast year. Without a seasonal difference, the pattern is now added as sine/cosine waves of the month of the year (Fourier terms, as in dynamic harmonic regression), with the number of waves (0-3) chosen by AICc, so a KPI without seasonality gets none.
+
+- **Slow SARIMA plot after the fix above**: choosing the number of yearly waves takes 4 fits, and the app fitted SARIMA three times per KPI (training data, whole series for the plot, whole series again for the Forecast tab), so up to 12 fits per view. The waves are now chosen once on the training data and reused, the whole-series model is fitted once and shared by the plot and the Forecast tab, and changing the number of months to forecast no longer refits anything.
+
+Forecast tab layout: the error table was squeezed into a third of the page next to a large plot, its last column hidden under the plot, and the forecast values ran into the KPI picker. The error table now spans the full width, the plot has a fixed height next to the forecast values, and the multi-KPI download has its own block with a compact search-box picker.
+
+- **Wrong cells highlighted in green**: the most accurate model's column was highlighted by boxing every cell whose text matched one of its values, so equal values in other columns were boxed too (and repeated values were missed). The column is now highlighted by its position.
 
 LSTM reworked (see "How the LSTM forecasts"):
 - **Its 90%+ accuracy was an easy test**: each test month was predicted from the *actual* previous months, a test that copying last month's value also passes with 96-99%. Its future forecast, fed with its own outputs instead, came out flat. It is now tested over the whole test period from its start, like SARIMA, and scored against the same baseline.
