@@ -43,6 +43,11 @@ replaced by the average % error next to the error of the "same month last
 year" reference, with a verdict ("x% smaller error than the reference");
 "Model is valid" becomes "Residual checks passed / failed", in plain words.
 The Forecast tab compares average errors (lower is better).
+
+Forecast tab layout: error table at full width, plot at a fixed height
+next to the forecast values, KPI picker and download in their own card.
+SARIMA is fitted once on the whole series and shared by the Model tab plot
+and the Forecast tab (sarima_full / sarima_future).
 """
 
 from shiny import reactive, render, ui
@@ -95,6 +100,12 @@ LSTM_COLUMNS = ["KPI", "Layers", "Units", "Optimizer", "Sequence length",
                 "Epochs", "Batch size", "Verbose", "Validation split"]
 
 DEFAULT_HORIZON = 12  # months, when the prediction time box is empty
+
+# Height of the Forecast tab plot (and of the values table next to it)
+PLOT_HEIGHT = 380
+
+# Documentation tab: render tables and ```code blocks``` (plain markdown2 shows them as text)
+MARKDOWN_EXTRAS = ["tables", "fenced-code-blocks"]
 
 
 # Load the kpi.ods file
@@ -696,36 +707,58 @@ def create_server():
             return settings
 
 
-        # Train the SARIMA model
+        # SARIMA is fitted in three steps, each cached by Shiny and redone
+        # only when its own inputs change:
+        # 1. sarima(): orders and yearly waves chosen on the training data
+        #    (first 80%), then the test forecast. Changes with the KPI or the
+        #    parameters, not with the prediction time.
+        # 2. sarima_full(): the same model refitted ONCE on the whole series,
+        #    reusing the number of waves chosen in step 1.
+        # 3. sarima_future(): the forecast of the next months from step 2.
+        #    Changing the prediction time only redoes this step (instant).
+        # The plot and the Forecast tab share steps 2 and 3. They used to
+        # refit the whole series separately, each time choosing the waves
+        # again (4 fits each), which made the SARIMA plot very slow.
         @reactive.calc
         def sarima():
             df = selected_data()
 
             if df is None:
-                return (None, None, None, None)
+                return (None, None, None, None, None)
 
             timeseries = df.dropna()
             train_size = int(len(timeseries) * 0.80)
             train, test = timeseries[:train_size], timeseries[train_size:]
-            (trend, seasonal, residual) = sarima_model.series_decompose(train)
 
             if input.model_params() and input.train_model_btn():
                 (p, d, q) = input.p_sarima(), input.d_sarima(), input.q_sarima()
                 (P, D, Q) = input.P_sarima(), input.D_sarima(), input.Q_sarima()
             elif input.saved_params():
+                (trend, seasonal, residual) = sarima_model.series_decompose(train)
                 p, d, q, P, D, Q = _sarima_orders(timeseries.name, train, residual)
             else:
-                p, d, q, P, D, Q = sarima_model.select_orders(train, residual)
-
-            horizon = input.predictionHorizon()
-            if horizon is None or horizon == "":
-                horizon = 0
+                p, d, q, P, D, Q = sarima_model.select_orders(train)
 
             fitted_model = sarima_model.sarima_training(train, p, d, q, P, D, Q)
             forecast = sarima_model.sarima_forecasting(test, fitted_model)
-            fig = sarima_model.sarima_predictions(fitted_model, timeseries, train, forecast, horizon, p, d, q, P, D, Q)
+            return (fitted_model, train, test, forecast, (p, d, q, P, D, Q))
 
-            return (fitted_model, fig, test, forecast)
+
+        @reactive.calc
+        def sarima_full():
+            fitted_model, _, _, _, orders = sarima()
+            if fitted_model is None:
+                return None
+            return sarima_model.sarima_training(selected_data().dropna(), *orders,
+                                                K=sarima_model.fourier_k(fitted_model))
+
+
+        @reactive.calc
+        def sarima_future():
+            full_model = sarima_full()
+            if full_model is None:
+                return pd.Series(dtype=float)
+            return sarima_model.forecast_from(full_model, selected_data().dropna().index[-1], _horizon())
 
 
         # SARIMA predictions plot
@@ -733,10 +766,11 @@ def create_server():
         def sarimaPlot():
             if input.model_choice() != "sarima":
                 return None
-            (fitted_model, fig, test, forecast) = sarima()
+            (fitted_model, train, test, forecast, orders) = sarima()
             if fitted_model is None:
                 return go.Figure()
-            return fig
+            return sarima_model.sarima_predictions(fitted_model, selected_data(), train, forecast,
+                                                   sarima_future(), *orders)
 
 
         # Train the Prophet model
@@ -820,7 +854,7 @@ def create_server():
             timeseries = df.dropna()
 
             if modelchoice == "sarima":
-                (fitted_model, fig, test, forecast) = sarima()
+                (fitted_model, _, test, forecast, _) = sarima()
                 newdf = pd.DataFrame()
                 newdf["Date"] = test.index
                 newdf["Test data (y)"] = test.values
@@ -857,7 +891,7 @@ def create_server():
         def BPTest():
             if selected_data() is None or input.model_choice() != "sarima":
                 return ""
-            sarima_fitted_model, _, _, _ = sarima()
+            sarima_fitted_model = sarima()[0]
             residuals = sarima_fitted_model.resid
             bp_test = sms.het_breuschpagan(residuals, sm.add_constant(np.arange(len(residuals))))
             labels = ['LM Statistic', 'LM-Test p-value', 'F-Statistic', 'F-Test p-value', 'Null Hypothesis', 'Alternative Hypothesis']
@@ -870,7 +904,7 @@ def create_server():
         def LBTest():
             if selected_data() is None or input.model_choice() != "sarima":
                 return ""
-            sarima_fitted_model, _, _, _ = sarima()
+            sarima_fitted_model = sarima()[0]
             residuals = sarima_fitted_model.resid
             ljung_box_test = acorr_ljungbox(residuals, lags=[15], return_df=True)
             ljung_box_test['Null Hypothesis'] = 'There is no autocorrelation in the residuals'
@@ -885,7 +919,7 @@ def create_server():
         def sarima_accuracy():
             if selected_data() is None:
                 return None
-            (fitted_model, fig, test, forecast) = sarima()
+            (fitted_model, _, test, forecast, _) = sarima()
             (mae, mse, mape) = sarima_model.accuracy_metrics(forecast, test)
             metrics = {"Mean Squared Error": mse,
                        "Root Mean Squared Error": m.sqrt(mse),
@@ -988,7 +1022,7 @@ def create_server():
             residual_lines, residuals_ok = [], None
 
             if input.model_choice() == "sarima":
-                sarima_fitted_model, _, _, _ = sarima()
+                sarima_fitted_model = sarima()[0]
                 residuals = sarima_fitted_model.resid
                 bp_test = sms.het_breuschpagan(residuals, sm.add_constant(np.arange(len(residuals))))
                 ljung_box_test = acorr_ljungbox(residuals, lags=[15], return_df=True)
@@ -1069,7 +1103,7 @@ def create_server():
 
         @render.ui
         def markdown_preview():
-            return ui.HTML(markdown2.markdown(markdown_content()))
+            return ui.HTML(markdown2.markdown(markdown_content(), extras=MARKDOWN_EXTRAS))
 
         @reactive.effect
         @reactive.event(input.save_btn)
@@ -1091,11 +1125,8 @@ def create_server():
             timeseries = df.dropna()
             horizon = _horizon()
 
-            # Same orders as the Model tab, refitted on the whole series
-            sarima_fitted_model, _, _, _ = sarima()
-            (p, d, q) = sarima_fitted_model.model.order
-            (P, D, Q, _s) = sarima_fitted_model.model.seasonal_order
-            sarima_future = sarima_model.future_forecast(timeseries, p, d, q, P, D, Q, horizon)
+            # Same model as the Model tab plot (fitted once on the whole series)
+            sarima_values = sarima_future()
 
             prophet_fitted_model, scaler = prophet_model.prophet_training(timeseries)
             prophet_forecast = prophet_model.prophet_forecasting(prophet_fitted_model, horizon, scaler)
@@ -1110,8 +1141,8 @@ def create_server():
                 lstm_forecast = np.full(horizon, np.nan)
 
             new_df = pd.DataFrame()
-            new_df["Date"] = sarima_future.index
-            new_df["SARIMA"] = sarima_future.values
+            new_df["Date"] = sarima_values.index
+            new_df["SARIMA"] = sarima_values.values
             new_df["Prophet"] = prophet_forecast['yhat'][-horizon:].values
             new_df["LSTM"] = lstm_forecast
             return new_df.round(2)
@@ -1146,18 +1177,15 @@ def create_server():
                 return ui.HTML(df.to_html(index=False, classes='table table-striped table-hover', border=0))
             most_accurate_model = min(mapes, key=mapes.get)
 
-            df = df.round(2)
-            html = df.to_html(index=False, classes='table table-striped table-hover', border=0)
-            html = html.replace(
-                f'<th>{most_accurate_model}</th>',
-                f'<th style="border: 3px solid green;">{most_accurate_model}</th>'
-            )
-            for value in df[most_accurate_model]:
-                html = html.replace(
-                    f'<td>{value}</td>',
-                    f'<td style="border: 3px solid green;">{value}</td>'
-                )
-            return ui.HTML(html)
+            # Highlight the most accurate model's COLUMN, by position. It used
+            # to box every cell whose text matched one of that column's
+            # values, so equal values in other columns were boxed too.
+            column = list(df.columns).index(most_accurate_model) + 1  # CSS counts from 1
+            html = df.round(2).to_html(index=False, classes='table table-hover forecast-values', border=0)
+            style = (f"<style>.forecast-values th:nth-child({column}), "
+                     f".forecast-values td:nth-child({column}) "
+                     "{ background-color: #DDFFDD; color: #006400; font-weight: 600; }</style>")
+            return ui.HTML(style + html)
 
 
         # Average % error of all models for the selected data, lower is better
@@ -1180,6 +1208,11 @@ def create_server():
             return ui.TagList(ui.HTML(style_table(pd.DataFrame(errors, index=[0]))), note)
 
 
+        def df_name():
+            df = selected_data()
+            return "" if df is None else df.name
+
+
         # Plot of all models' predictions
         @render_widget
         def predictions_plot():
@@ -1187,12 +1220,16 @@ def create_server():
             if df is None or df.empty:
                 return go.Figure()
             fig = make_subplots()
-            fig.add_trace(go.Scatter(x=df["Date"], y=df["SARIMA"], mode='lines', name="SARIMA predictions"))
-            fig.add_trace(go.Scatter(x=df["Date"], y=df["Prophet"], mode='lines', name="Prophet predictions"))
+            fig.add_trace(go.Scatter(x=df["Date"], y=df["SARIMA"], mode='lines', name="SARIMA"))
+            fig.add_trace(go.Scatter(x=df["Date"], y=df["Prophet"], mode='lines', name="Prophet"))
             if not df["LSTM"].isna().all():
-                fig.add_trace(go.Scatter(x=df["Date"], y=df["LSTM"], mode='lines', name="LSTM predictions"))
-            fig.update_layout(title_text=f"Models forecast plot of the next {len(df)} months",
-                              yaxis_title="Forecast", xaxis_title="Date", template='plotly_white')
+                fig.add_trace(go.Scatter(x=df["Date"], y=df["LSTM"], mode='lines', name="LSTM"))
+            # Compact: no big title (the card has one), legend above the plot
+            fig.update_layout(title_text=f"Next {len(df)} months of {df_name()}",
+                              title_font_size=14, height=PLOT_HEIGHT,
+                              margin=dict(l=50, r=20, t=60, b=40),
+                              legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+                              yaxis_title=None, xaxis_title=None, template='plotly_white')
             return fig
 
 
@@ -1206,20 +1243,15 @@ def create_server():
             selected_kpis = input.selected_kpis()
 
             if not selected_kpis:
-                return ui.div("No KPIs selected")
+                return ui.div("No KPIs selected yet.", style="color: #696969;")
 
-            ui_elements = []
-            for kpi in selected_kpis:
-                ui_elements.append(ui.h6(f"Select Model for {kpi}"))
-                ui_elements.append(
-                    ui.input_select(
-                        id=f"model_{_kpi_id(kpi)}",
-                        label=None,
-                        choices=["SARIMA", "Prophet", "LSTM"],
-                        selected=None
-                    )
-                )
-            return ui.div(*ui_elements)
+            # One compact dropdown per KPI, two per row
+            dropdowns = [ui.column(6, ui.input_select(id=f"model_{_kpi_id(kpi)}",
+                                                      label=f"Model for {kpi}",
+                                                      choices=["SARIMA", "Prophet", "LSTM"],
+                                                      selected=None, width="100%"))
+                         for kpi in selected_kpis]
+            return ui.row(*dropdowns)
 
 
         # Forecast `horizon` months of one KPI with one model
@@ -1476,34 +1508,49 @@ def create_server():
             return ui.div(
                 ui.navset_tab(
                     ui.nav_panel("Modeling",
-                           ui.HTML("<h4 style='text-align:center;'>Modeling</h4>"),
                            ui.br(),
+                           # 1. How good is each model: full width, so the
+                           #    five columns of the error table have room
+                           ui.card(
+                               ui.card_header("Average error of each model"),
+                               ui.output_ui("models_accuracy"),
+                           ),
+                           # 2. The forecast: plot at a fixed height next to
+                           #    its values (scrollable)
                            ui.row(
-                               ui.column(4, ui.output_ui("models_accuracy"),
-                                            ui.br(),
-                                            ui.output_ui("predictions")),
-                               ui.column(8, output_widget("predictions_plot"),
-                                            ui.br(),
-                                            ui.br(),
-                                            ui.row(
-                                                ui.column(6,
-                                                          ui.input_select(
-                                                              id="selected_kpis",
-                                                              label="Choose KPIs",
-                                                              choices=kpi_choices,
-                                                              selected=None,
-                                                              multiple=True
-                                                          )
-                                                ),
-                                                ui.column(6, ui.output_ui("kpi_model")),
-                                            ),
-                                            ui.br(),
-                                            ui.row(
-                                                ui.column(4,),
-                                                ui.column(4, ui.download_button("download_predictions", ui.HTML('<i class="fa fa-download"></i> Download Predictions'), class_="btn")),
-                                                ui.column(4,)
-                                            ),
-                               )
+                               ui.column(7, ui.card(
+                                   ui.card_header("Forecast of the selected KPI"),
+                                   output_widget("predictions_plot", height=f"{PLOT_HEIGHT}px"),
+                               )),
+                               ui.column(5, ui.card(
+                                   ui.card_header("Forecast values (most accurate model in green)"),
+                                   ui.div(ui.output_ui("predictions"),
+                                          style=f"max-height: {PLOT_HEIGHT}px; overflow-y: auto;"),
+                               )),
+                           ),
+                           # 3. Several KPIs at once, for the Forecast tab
+                           #    and the Excel download
+                           ui.card(
+                               ui.card_header("Forecast several KPIs"),
+                               ui.row(
+                                   ui.column(5,
+                                             ui.input_selectize(
+                                                 id="selected_kpis",
+                                                 label="Choose KPIs",
+                                                 choices=kpi_choices,
+                                                 selected=None,
+                                                 multiple=True,
+                                                 width="100%",
+                                                 options={"placeholder": "Type or pick KPIs..."},
+                                             ),
+                                             ui.div("Then pick a model for each one, and download the "
+                                                    "forecast or see it in the Forecast tab.",
+                                                    style="color: #696969; font-size: 0.85rem;"),
+                                   ),
+                                   ui.column(7, ui.output_ui("kpi_model")),
+                               ),
+                               ui.div(ui.download_button("download_predictions", ui.HTML('<i class="fa fa-download"></i> Download Predictions'), class_="btn"),
+                                      style="text-align: center; margin-top: 0.5rem;"),
                            ),
                     ),
 
@@ -1524,7 +1571,7 @@ def create_server():
         def documentation_content():
             if READ_ONLY:
                 # Public demo: show the documentation only, no editor
-                return ui.div(ui.HTML(markdown2.markdown(read_markdown_file(DOC_FILE))))
+                return ui.div(ui.HTML(markdown2.markdown(read_markdown_file(DOC_FILE), extras=MARKDOWN_EXTRAS)))
             return ui.div(
                 ui.row(
                     ui.column(4, ui.input_text_area("markdown_editor", ui.h6("Edit Documentation"), read_markdown_file(DOC_FILE), rows=50),

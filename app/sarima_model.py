@@ -57,6 +57,13 @@ customer care calls got flat future forecasts, for three reasons:
   yearly pattern is now added as sine/cosine terms of the month (Fourier
   terms), their number (0-3) chosen by AICc (sarima_training).
 
+Speed fix (Nov 2026): choosing the number of waves takes 4 fits, and the
+app was fitting SARIMA 3 times per KPI (training data, whole series for
+the plot, whole series again for the Forecast tab), so up to 12 fits. The
+waves are now chosen once, on the training data, and passed on (K
+argument of future_forecast); the whole-series fit is done once and
+reused by the plot and the Forecast tab (forecast_from).
+
 Forecast fixes:
 - the test forecast was shifted by one month (each forecast was compared
   with the previous month's actual value); the training fit in the plot too
@@ -359,21 +366,33 @@ def next_months(last_date, horizon):
     return pd.DatetimeIndex([last_date + pd.DateOffset(months=k) for k in range(1, horizon + 1)])
 
 
-def future_forecast(timeseries, p, d, q, P, D, Q, horizon):
-    """Refit the model on the WHOLE series and forecast the `horizon` months
-    after its last date. The model fitted on the training split only is for
-    testing: forecasting the future with it would ignore the test period
-    (the most recent 20% of the data) and start from the wrong point."""
-    ts = timeseries.dropna()
+def forecast_from(fitted_model, last_date, horizon):
+    """Forecast the `horizon` months after `last_date` with a model already
+    fitted up to that date (no refit: changing the horizon is instant)."""
     if horizon is None or horizon < 1:
         return pd.Series(dtype=float)
-    full_model = sarima_training(ts, p, d, q, P, D, Q)
-    dates = next_months(ts.index[-1], horizon)
-    values = np.asarray(full_model.forecast(horizon, exog=_future_exog(full_model, dates)))
+    dates = next_months(last_date, horizon)
+    values = np.asarray(fitted_model.forecast(horizon, exog=_future_exog(fitted_model, dates)))
     return pd.Series(values, index=dates)
 
 
-def sarima_predictions(fitted_model, timeseries, train, forecast, horizon, p, d, q, P, D, Q):
+def future_forecast(timeseries, p, d, q, P, D, Q, horizon, K=None):
+    """Refit the model on the WHOLE series and forecast the `horizon` months
+    after its last date. The model fitted on the training split only is for
+    testing: forecasting the future with it would ignore the test period
+    (the most recent 20% of the data) and start from the wrong point.
+    Pass K (the number of yearly waves the training fit chose, fourier_k)
+    to avoid choosing it again: that takes 4 fits instead of 1."""
+    ts = timeseries.dropna()
+    if horizon is None or horizon < 1:
+        return pd.Series(dtype=float)
+    full_model = sarima_training(ts, p, d, q, P, D, Q, K)
+    return forecast_from(full_model, ts.index[-1], horizon)
+
+
+def sarima_predictions(fitted_model, timeseries, train, forecast, future, p, d, q, P, D, Q):
+    """Plot of the data, the training fit, the test forecast and `future`
+    (a Series from future_forecast / forecast_from, possibly empty)."""
     timeseries = timeseries.dropna()
     fig = make_subplots()
     fig.add_trace(go.Scatter(x=timeseries.index, y=timeseries, mode='lines', name=f"{timeseries.name}"))
@@ -383,8 +402,7 @@ def sarima_predictions(fitted_model, timeseries, train, forecast, horizon, p, d,
     fitted = pd.Series(np.asarray(fitted_model.fittedvalues), index=train.index)[burn_in:]
     fig.add_trace(go.Scatter(x=fitted.index, y=fitted.values, mode='lines', name="Train predictions"))
     fig.add_trace(go.Scatter(x=forecast.index, y=forecast.values, mode='lines', name="Test predictions"))
-    future = future_forecast(timeseries, p, d, q, P, D, Q, horizon)
-    if not future.empty:
+    if future is not None and not future.empty:
         fig.add_trace(go.Scatter(x=future.index, y=future.values, mode='lines', name="Future predictions"))
     fig.update_layout(yaxis_title=f"{train.name}", xaxis_title="Date", template='plotly_white')
     fig.update_layout(title_text=f"{model_label(p, d, q, P, D, Q, fourier_k(fitted_model))} plot of {train.name}")
